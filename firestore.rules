@@ -1,0 +1,72 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    match /users/{userId} {
+      // Users manage only their own profile document. Admins may read user profiles
+      // for dashboard statistics, but they cannot edit another user's data.
+      allow read: if signedIn() && (request.auth.uid == userId || isAdmin());
+      allow write: if signedIn() && request.auth.uid == userId;
+
+      match /{document=**} {
+        allow read, write: if signedIn() && request.auth.uid == userId;
+      }
+    }
+
+    match /admins/{adminId} {
+      allow read: if signedIn() && request.auth.uid == adminId;
+      allow write: if false;
+    }
+
+    match /supportTickets/{ticketId} {
+      allow create: if signedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 120
+        && request.resource.data.category is string
+        && request.resource.data.category.size() <= 40
+        && request.resource.data.subject is string
+        && request.resource.data.subject.size() <= 100
+        && request.resource.data.message is string
+        && request.resource.data.message.size() <= 1500
+        && request.resource.data.status == 'Open'
+        && request.resource.data.adminReply == '';
+
+      allow read: if signedIn()
+        && (resource.data.ownerId == request.auth.uid || isAdmin());
+
+      allow update, delete: if isAdmin();
+    }
+
+    match /stories/{storyId} {
+      allow read: if true;
+
+      allow create: if signedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.title is string
+        && request.resource.data.experience is string
+        && request.resource.data.location is string
+        && request.resource.data.rating is number
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5;
+
+      allow update: if signedIn()
+        && resource.data.ownerId == request.auth.uid
+        && request.resource.data.ownerId == request.auth.uid;
+
+      allow delete: if signedIn()
+        && (resource.data.ownerId == request.auth.uid || isAdmin());
+    }
+  }
+}

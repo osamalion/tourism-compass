@@ -1,0 +1,838 @@
+(function () {
+  'use strict';
+
+  const STORAGE_KEY = 'tc_v5_state';
+
+  function readLocalJson(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch (err) {
+      console.warn(`Ignoring invalid local data for ${key}.`, err);
+      return fallback;
+    }
+  }
+
+  const defaultState = {
+    lang: localStorage.getItem('tc_lang') || 'en',
+    user: null,
+    accounts: [],
+    trips: readLocalJson('tc_trips', []),
+    stories: readLocalJson('tc_stories', []),
+    visited: {},
+    manualDraft: ['amman'],
+    currentPlan: null,
+    activeTrip: null,
+    activeStopIndex: 0,
+    activeStartedAt: null,
+    rating: 5
+  };
+  let state = loadState();
+  let cameraStream = null;
+  let capturedScanBlob = null;
+  let capturedScanUrl = '';
+  let scanAnalyzing = false;
+  let storyDraftImage = '';
+  let publicStories = [];
+  let publicStoriesReady = false;
+  let firebaseAuth = null;
+  let firebaseAuthApi = null;
+  let firebaseAuthResolved = false;
+  let firebaseDb = null;
+  let firebaseStoreApi = null;
+  let cloudHydrating = false;
+  let cloudSaveTimer = null;
+  let cloudSyncState = 'idle';
+
+  const FIREBASE_SDK_VERSION = '12.19.0';
+  const firebaseReady = (async () => {
+    if (!window.TOURISM_FIREBASE_CONFIG) throw new Error('Firebase configuration is missing.');
+    const [{ initializeApp }, { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, updateProfile }, { getFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs, writeBatch, serverTimestamp }] = await Promise.all([
+      import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-app.js`),
+      import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-auth.js`),
+      import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-firestore.js`)
+    ]);
+    const firebaseApp = initializeApp(window.TOURISM_FIREBASE_CONFIG);
+    firebaseAuth = getAuth(firebaseApp);
+    firebaseDb = getFirestore(firebaseApp);
+    firebaseAuthApi = { createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, updateProfile };
+    firebaseStoreApi = { doc, getDoc, setDoc, deleteDoc, collection, getDocs, writeBatch, serverTimestamp };
+    await setPersistence(firebaseAuth, browserLocalPersistence);
+    await loadPublicStories();
+    onAuthStateChanged(firebaseAuth, async user => {
+      firebaseAuthResolved = true;
+      const previousUserId = state.user?.id || null;
+      if (user) {
+        state.user = { id: user.uid, name: user.displayName || state.user?.name || '', email: user.email || '' };
+        saveLocalOnly();
+        await loadCloudState(user, previousUserId === user.uid);
+      } else {
+        state.user = null;
+        clearUserScopedState();
+        saveLocalOnly();
+        render();
+      }
+    });
+    return { auth: firebaseAuth, db: firebaseDb, ...firebaseAuthApi, ...firebaseStoreApi };
+  })().catch(err => {
+    firebaseAuthResolved = true;
+    cloudSyncState = 'error';
+    console.error('Firebase initialization failed:', err);
+    setTimeout(() => toast(txt('Could not connect to the service. Check your internet connection.', 'تعذر الاتصال بالخدمة. تحقق من اتصال الإنترنت.')), 250);
+    throw err;
+  });
+
+  function firebaseMessage(error) {
+    const code = error?.code || '';
+    const ar = state.lang === 'ar';
+    const messages = {
+      'auth/email-already-in-use': ar ? 'هذا البريد مسجل بالفعل.' : 'This email is already registered.',
+      'auth/invalid-email': ar ? 'البريد الإلكتروني غير صالح.' : 'Enter a valid email address.',
+      'auth/weak-password': ar ? 'كلمة المرور يجب أن تكون 6 أحرف على الأقل.' : 'Password must be at least 6 characters.',
+      'auth/invalid-credential': ar ? 'البريد الإلكتروني أو كلمة المرور غير صحيحة.' : 'Email or password is incorrect.',
+      'auth/user-disabled': ar ? 'تم تعطيل هذا الحساب.' : 'This account has been disabled.',
+      'auth/too-many-requests': ar ? 'محاولات كثيرة. حاول مرة أخرى بعد قليل.' : 'Too many attempts. Please try again later.',
+      'auth/network-request-failed': ar ? 'تعذر الاتصال بالخدمة. تحقق من الإنترنت.' : 'Could not reach the service. Check your internet connection.'
+    };
+    return messages[code] || (ar ? 'حدث خطأ أثناء المصادقة. حاول مرة أخرى.' : 'Authentication failed. Please try again.');
+  }
+
+  const routes = new Set(['home', 'explore', 'results', 'destination', 'plan', 'ai-planner', 'itinerary', 'manual-planner', 'live-trip', 'scan', 'scan-result', 'stories', 'story', 'share-story', 'passport', 'login', 'profile', 'my-trips', 'settings']);
+
+  const LANDMARKS = {
+    petra: {
+      key: 'petra', name: 'Petra', region: "Ma'an Governorate", category: 'History & Heritage', hero: 'petra',
+      destinationTitle: 'Petra — The Rose City', destinationSubtitle: 'Ancient Nabataean heritage, walking routes, visitor services, and smart trip guidance.',
+      scanTitle: 'The Treasury — Petra', scanSubtitle: 'The captured image matches Petra.',
+      chips: [['Registered Landmark', 'green'], ['Heritage', ''], ['Walking Destination', 'orange']],
+      stats: [['From Amman', '≈ 236 km', ''], ['Typical Drive', '≈ 3h 10m', ''], ['Experience', 'History · Hiking', 'good'], ['Rating', '4.9 / 5', 'accent']],
+      about: 'Petra is an ancient Nabataean city carved into rose-colored sandstone. Visitors commonly enter through the Siq before reaching the Treasury and can continue toward royal tombs, viewpoints, and the Monastery.',
+      recognition: 'The recognition model looks for Petra’s rose-red sandstone, monumental rock-cut façades, columns, and the distinctive Treasury composition.',
+      experiences: ['Walk through the Siq to the Treasury', 'Continue toward the Royal Tombs and viewpoints', 'Hike toward the Monastery for a longer visit'],
+      tips: ['Wear comfortable walking shoes and carry water.', 'Morning visits are usually more comfortable for long walks.', 'Keep the camera steady and include the full façade when using Scan & Learn.'],
+      route: 'Approx. 3h 10m from Amman in the current prototype route.', transport: 'Private car, coach, tour bus, or local driver.', hotels: 'Accommodation options are available in and around Wadi Musa.', restaurants: 'Local and international dining options are available around the visitor area and Wadi Musa.', services: 'Visitor center, parking, guides, shops, and nearby essential services.',
+      storyTitle: 'The Story of the Treasury', story: 'The Treasury is one of Petra’s best-known Nabataean rock-cut façades. Its monumental frontage is carved directly into the sandstone cliff and combines Nabataean craftsmanship with classical architectural influences.',
+      ar: { name: 'البتراء', region: 'محافظة معان', category: 'التاريخ والتراث', destinationTitle: 'البتراء — المدينة الوردية', destinationSubtitle: 'تراث نبطي، مسارات مشي، خدمات للزوار وإرشاد ذكي للرحلة.', scanTitle: 'الخزنة — البتراء', about: 'البتراء مدينة نبطية أثرية منحوتة في الحجر الرملي الوردي. يدخل الزوار عادة عبر السيق للوصول إلى الخزنة ثم يمكنهم متابعة الزيارة نحو المدافن الملكية ونقاط المشاهدة والدير.', recognition: 'يبحث نموذج التعرف عن الحجر الرملي الوردي والواجهات الصخرية الضخمة والأعمدة والشكل المميز للخزنة.', experiences: ['المشي عبر السيق حتى الخزنة', 'متابعة الزيارة نحو المدافن الملكية ونقاط المشاهدة', 'الصعود باتجاه الدير لزيارة أطول'], tips: ['ارتدِ حذاءً مريحاً واحمل الماء.', 'الزيارة الصباحية عادة أكثر راحة للمشي الطويل.', 'ثبت الهاتف وأظهر الواجهة كاملة عند استخدام المسح الذكي.'], route: 'حوالي 3 ساعات و10 دقائق من عمّان ضمن بيانات العرض التجريبية.', transport: 'سيارة خاصة أو حافلة أو جولة سياحية أو سائق محلي.', hotels: 'تتوفر خيارات إقامة متعددة في وادي موسى وحولها.', restaurants: 'تتوفر مطاعم محلية وعالمية حول مركز الزوار ووادي موسى.', services: 'مركز زوار ومواقف وأدلاء ومتاجر وخدمات أساسية قريبة.', storyTitle: 'قصة الخزنة', story: 'الخزنة واحدة من أشهر الواجهات النبطية المنحوتة في الصخر، وتجمع بين براعة النحت النبطي وتأثيرات معمارية كلاسيكية.' }
+    },
+    'wadi-rum': {
+      key: 'wadi-rum', name: 'Wadi Rum', region: 'Aqaba Governorate', category: 'Nature & Adventure', hero: 'wadi-rum',
+      destinationTitle: 'Wadi Rum — Valley of the Moon', destinationSubtitle: 'Protected desert landscapes, Bedouin experiences, camps, routes, and adventure planning.', scanTitle: 'Wadi Rum — Protected Desert', scanSubtitle: 'The captured image matches Wadi Rum.',
+      chips: [['Registered Landmark', 'green'], ['Adventure', 'orange'], ['Desert Experience', '']],
+      stats: [['From Amman', '≈ 320 km', ''], ['Typical Drive', '≈ 4h', ''], ['Experience', 'Desert · Adventure', 'good'], ['Rating', '4.8 / 5', 'accent']],
+      about: 'Wadi Rum is a protected desert landscape in southern Jordan known for broad sand valleys, sandstone and granite mountains, dramatic rock formations, and Bedouin cultural experiences.', recognition: 'The recognition model looks for open red-orange desert valleys, isolated sandstone mountains, cliffs, arches, and the characteristic Wadi Rum landscape.', experiences: ['Take a guided 4×4 desert tour', 'Watch sunset from a desert viewpoint', 'Stay in a camp and experience the night sky'], tips: ['Use a local guide for routes that leave the main visitor area.', 'Carry water and sun protection during daytime activities.', 'For scanning, include both the desert floor and surrounding rock formations.'], route: 'Approx. 4h from Amman; many desert tracks require a local 4×4 vehicle.', transport: 'Car or coach to the visitor area, then local 4×4 tours for desert routes.', hotels: 'Desert camps range from simple tents to higher-end dome accommodation.', restaurants: 'Most camps provide meals, with additional local options near the visitor area.', services: 'Visitor center, local guides, camps, transport operators, and emergency contacts.', storyTitle: 'The Story of Wadi Rum', story: 'Wadi Rum combines dramatic desert geology with a long human history. Its valleys, cliffs, inscriptions, and Bedouin traditions make it one of Jordan’s most distinctive natural and cultural landscapes.',
+      ar: { name: 'وادي رم', region: 'محافظة العقبة', category: 'الطبيعة والمغامرة', destinationTitle: 'وادي رم — وادي القمر', destinationSubtitle: 'مناظر صحراوية محمية وتجارب بدوية ومخيمات ومسارات ومغامرات.', scanTitle: 'وادي رم — الصحراء المحمية', about: 'وادي رم منطقة صحراوية محمية في جنوب الأردن تشتهر بالوديان الرملية الواسعة والجبال الصخرية والتكوينات الطبيعية والتجارب البدوية.', recognition: 'يبحث نموذج التعرف عن الرمال الحمراء والبرتقالية والجبال الصخرية المنفردة والأقواس والمناظر المميزة لوادي رم.', experiences: ['جولة صحراوية بسيارة دفع رباعي مع دليل', 'مشاهدة الغروب من نقطة مرتفعة', 'المبيت في مخيم وتجربة سماء الصحراء ليلاً'], tips: ['استخدم دليلاً محلياً للمسارات البعيدة عن المنطقة الرئيسية.', 'احمل الماء ووسائل الحماية من الشمس.', 'أظهر أرضية الصحراء والجبال المحيطة عند المسح.'], route: 'حوالي 4 ساعات من عمّان ضمن بيانات العرض، وتتطلب بعض المسارات مركبة دفع رباعي.', transport: 'سيارة أو حافلة حتى مركز الزوار ثم جولات دفع رباعي محلية.', hotels: 'تتنوع المخيمات بين الخيام البسيطة والقبب الفاخرة.', restaurants: 'معظم المخيمات توفر الوجبات مع خيارات محلية إضافية قرب مركز الزوار.', services: 'مركز زوار وأدلاء ومخيمات ومشغلو نقل وجهات اتصال للطوارئ.', storyTitle: 'قصة وادي رم', story: 'يجمع وادي رم بين جيولوجيا صحراوية مميزة وتاريخ إنساني طويل، وتمنحه الوديان والنقوش والتقاليد البدوية هوية فريدة.' }
+    },
+    'dead-sea': {
+      key: 'dead-sea', name: 'Dead Sea', region: 'Jordan Valley', category: 'Wellness & Relaxation', hero: 'dead-sea', destinationTitle: 'Dead Sea — Jordan Shore', destinationSubtitle: 'Floating, wellness experiences, resort access, shore planning, and travel guidance.', scanTitle: 'Dead Sea — Jordan Shore', scanSubtitle: 'The captured image matches the Dead Sea.', chips: [['Registered Landmark', 'green'], ['Wellness', ''], ['Shore Experience', 'orange']], stats: [['From Amman', '≈ 55 km', ''], ['Typical Drive', '≈ 1h', ''], ['Experience', 'Wellness · Relaxation', 'good'], ['Rating', '4.7 / 5', 'accent']], about: 'The Dead Sea is a hypersaline lake in the Jordan Rift Valley. Its very salty water creates strong buoyancy, while the Jordanian shore is known for resort, spa, and wellness tourism.', recognition: 'The recognition model looks for a calm blue salt-lake shoreline, pale salt or mineral edges, arid mountains, and the wide open Dead Sea landscape.', experiences: ['Float in the highly saline water', 'Try a resort or spa day experience', 'Watch the sunset across the lake and surrounding hills'], tips: ['Avoid getting the salty water in your eyes.', 'Use designated access areas and follow local safety instructions.', 'For scanning, include the shoreline, water, and surrounding arid landscape.'], route: 'Approx. 1h from Amman using the main road toward the Jordan Valley and Dead Sea shore.', transport: 'Private car, taxi, resort shuttle, or organized tour.', hotels: 'The Jordanian shore includes resorts, spas, day-pass options, and overnight stays.', restaurants: 'Dining is available inside resorts and at locations along the main shore corridor.', services: 'Resorts, changing facilities, parking, shops, and nearby medical services.', storyTitle: 'Why the Dead Sea Is Unique', story: 'The Dead Sea is famous for its extreme salinity and unusually strong buoyancy. Its shore landscape and mineral-rich environment have made it a major wellness destination in Jordan.',
+      ar: { name: 'البحر الميت', region: 'وادي الأردن', category: 'الاستجمام والعافية', destinationTitle: 'البحر الميت — الشاطئ الأردني', destinationSubtitle: 'تجربة الطفو والاستجمام والمنتجعات والتخطيط للزيارة.', scanTitle: 'البحر الميت — الشاطئ الأردني', about: 'البحر الميت بحيرة شديدة الملوحة في وادي الأردن، وتمنح ملوحته العالية قدرة كبيرة على الطفو، كما يشتهر الشاطئ الأردني بالسياحة العلاجية والمنتجعات.', recognition: 'يبحث نموذج التعرف عن مياه زرقاء هادئة وحواف ملحية أو معدنية وجبال جافة والمشهد المفتوح للبحر الميت.', experiences: ['تجربة الطفو في المياه عالية الملوحة', 'قضاء يوم في منتجع أو سبا', 'مشاهدة الغروب فوق المياه والتلال المحيطة'], tips: ['تجنب دخول المياه المالحة إلى العينين.', 'استخدم مناطق الدخول المخصصة واتبع تعليمات السلامة.', 'أظهر الشاطئ والمياه والجبال الجافة عند استخدام المسح.'], route: 'حوالي ساعة من عمّان عبر الطريق الرئيسي باتجاه وادي الأردن.', transport: 'سيارة خاصة أو تاكسي أو حافلة منتجع أو جولة منظمة.', hotels: 'يتوفر على الشاطئ الأردني عدد من المنتجعات والسبا وخيارات الدخول اليومي والإقامة.', restaurants: 'تتوفر خيارات الطعام داخل المنتجعات وعلى امتداد الطريق الرئيسي للشاطئ.', services: 'منتجعات وغرف تبديل ومواقف ومتاجر وخدمات طبية قريبة.', storyTitle: 'لماذا البحر الميت مميز؟', story: 'يشتهر البحر الميت بملوحته العالية جداً وقدرته الكبيرة على الطفو، كما جعلته بيئته الغنية بالمعادن وجهة مهمة للاستجمام والعافية.' }
+    }
+  };
+
+  const DESTINATIONS = {
+    amman: { key: 'amman', name: 'Amman', ar: 'عمّان', tags: ['history', 'food', 'photography'], cost: 38, drive: 0, desc: 'Citadel, Roman Theatre, downtown, and local food.', descAr: 'القلعة والمدرج الروماني ووسط البلد وتجربة الطعام المحلي.' },
+    jerash: { key: 'jerash', name: 'Jerash', ar: 'جرش', tags: ['history', 'photography'], cost: 30, drive: 1, desc: 'Roman ruins, colonnaded streets, and archaeological walks.', descAr: 'آثار رومانية وشوارع معمدة وجولات أثرية.' },
+    'dead-sea': { key: 'dead-sea', name: 'Dead Sea', ar: 'البحر الميت', tags: ['wellness', 'photography'], cost: 55, drive: 1.2, desc: 'Floating, wellness, sunset, and resort time.', descAr: 'الطفو والاستجمام والغروب وتجربة المنتجعات.', landmark: 'dead-sea' },
+    madaba: { key: 'madaba', name: 'Madaba & Mount Nebo', ar: 'مادبا وجبل نيبو', tags: ['history', 'religious', 'photography'], cost: 35, drive: 1.2, desc: 'Mosaics, viewpoints, and religious heritage.', descAr: 'الفسيفساء والإطلالات والتراث الديني.' },
+    petra: { key: 'petra', name: 'Petra', ar: 'البتراء', tags: ['history', 'adventure', 'photography'], cost: 75, drive: 3.1, desc: 'The Siq, Treasury, viewpoints, and Nabataean heritage.', descAr: 'السيق والخزنة ونقاط المشاهدة والتراث النبطي.', landmark: 'petra' },
+    'wadi-rum': { key: 'wadi-rum', name: 'Wadi Rum', ar: 'وادي رم', tags: ['adventure', 'photography', 'culture'], cost: 78, drive: 2, desc: '4×4 desert tour, sunset, and a camp experience.', descAr: 'جولة دفع رباعي وغروب وتجربة مخيم صحراوي.', landmark: 'wadi-rum' },
+    aqaba: { key: 'aqaba', name: 'Aqaba', ar: 'العقبة', tags: ['wellness', 'food', 'adventure'], cost: 62, drive: 1.1, desc: 'Red Sea waterfront, food, and optional water activities.', descAr: 'واجهة البحر الأحمر والطعام وأنشطة مائية اختيارية.' }
+  };
+
+
+  // Planning estimates used only by the local smart-planner demo. Live routing will replace these later.
+  const ROUTE_HOURS = {
+    amman: { jerash: .8, 'dead-sea': 1, madaba: .7, petra: 3.1, 'wadi-rum': 4, aqaba: 4 },
+    jerash: { 'dead-sea': 1.5, madaba: 1.4, petra: 3.6, 'wadi-rum': 4.5, aqaba: 4.8 },
+    'dead-sea': { madaba: .7, petra: 2.8, 'wadi-rum': 3.5, aqaba: 3.6 },
+    madaba: { petra: 2.6, 'wadi-rum': 3.4, aqaba: 3.7 },
+    petra: { 'wadi-rum': 1.8, aqaba: 2.1 },
+    'wadi-rum': { aqaba: 1 }
+  };
+  function travelHours(a, b) {
+    if (!a || !b || a === b) return 0;
+    return ROUTE_HOURS[a]?.[b] ?? ROUTE_HOURS[b]?.[a] ?? Math.max(.8, Math.abs((DESTINATIONS[a]?.drive || 1) - (DESTINATIONS[b]?.drive || 1)) + 1);
+  }
+  function formatHours(value) {
+    const total = Math.max(0, Math.round(Number(value || 0) * 60)), h = Math.floor(total / 60), m = total % 60;
+    if (!h) return txt(`${m} min`, `${m} د`);
+    if (!m) return txt(`${h}h`, `${h} س`);
+    return txt(`${h}h ${m}m`, `${h} س ${m} د`);
+  }
+  function stopName(stop) { const d = DESTINATIONS[stop?.key]; return state.lang === 'ar' ? (stop?.ar || d?.ar || stop?.name || '') : (stop?.name || d?.name || ''); }
+
+  const BUILTIN_STORIES = [
+    { id: 'demo-rum', title: 'Wadi Rum Sunset', titleAr: 'غروب وادي رم', location: 'Wadi Rum', locationAr: 'وادي رم', rating: 4.9, experience: 'A calm sunset viewpoint, a short jeep route, and a useful reminder to carry water even late in the afternoon.', experienceAr: 'إطلالة هادئة وقت الغروب وجولة قصيرة بسيارة دفع رباعي مع تذكير بأهمية حمل الماء حتى في ساعات المساء.', builtin: true },
+    { id: 'demo-salt', title: 'A Morning in As-Salt', titleAr: 'صباح في السلط', location: 'As-Salt', locationAr: 'السلط', rating: 4.8, experience: 'Walking through the old streets early in the morning made the route comfortable and gave us time to stop at local shops.', experienceAr: 'المشي في الشوارع القديمة صباحاً جعل الجولة مريحة وأعطانا وقتاً للتوقف في المحلات المحلية.', builtin: true },
+    { id: 'demo-petra', title: 'First Visit to Petra', titleAr: 'أول زيارة للبتراء', location: 'Petra', locationAr: 'البتراء', rating: 5, experience: 'Starting early helped with photography and made the longer walking route much easier.', experienceAr: 'البدء مبكراً ساعد في التصوير وجعل مسار المشي الطويل أسهل بكثير.', builtin: true }
+  ];
+
+  function loadState() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') || {};
+      return {
+        ...defaultState,
+        ...raw,
+        accounts: Array.isArray(raw.accounts) ? raw.accounts : defaultState.accounts,
+        trips: Array.isArray(raw.trips) ? raw.trips : defaultState.trips,
+        stories: Array.isArray(raw.stories) ? raw.stories : defaultState.stories,
+        visited: raw.visited && typeof raw.visited === 'object' && !Array.isArray(raw.visited) ? raw.visited : {},
+        manualDraft: Array.isArray(raw.manualDraft) ? raw.manualDraft : defaultState.manualDraft
+      };
+    } catch (e) { return { ...defaultState, accounts: [], trips: [], stories: [], visited: {}, manualDraft: ['amman'] }; }
+  }
+  function saveLocalOnly() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem('tc_lang', state.lang);
+    localStorage.setItem('tc_user', JSON.stringify(state.user));
+    localStorage.setItem('tc_trips', JSON.stringify(state.trips));
+    localStorage.setItem('tc_stories', JSON.stringify(state.stories));
+  }
+  function clearUserScopedState() {
+    state.trips = [];
+    state.stories = [];
+    state.visited = {};
+    state.manualDraft = ['amman'];
+    state.currentPlan = null;
+    state.activeTrip = null;
+    state.activeStopIndex = 0;
+    state.activeStartedAt = null;
+  }
+
+  function ownsStory(story, user = state.user) {
+    if (!story || !user) return false;
+    return story.ownerId === user.id || (!story.ownerId && story.owner === user.email);
+  }
+
+  function storyDate(story) {
+    const value = story?.date || story?.createdAt || '';
+    return typeof value === 'string' ? value : '';
+  }
+
+  function normalizeStory(data, documentId) {
+    const story = { ...data };
+    story.id = String(story.id || documentId || '');
+    story.title = String(story.title || '');
+    story.experience = String(story.experience || '');
+    story.location = String(story.location || '');
+    story.rating = Number(story.rating || 5);
+    story.image = typeof story.image === 'string' ? story.image : '';
+    story.ownerId = String(story.ownerId || '');
+    story.authorName = String(story.authorName || txt('Traveler', 'مسافر'));
+    story.date = storyDate(story) || new Date(0).toISOString();
+    return story;
+  }
+
+  function communityStories() {
+    const items = new Map();
+    publicStories.forEach(story => items.set(story.id, story));
+    state.stories.forEach(story => { if (story?.id && !items.has(story.id)) items.set(story.id, story); });
+    return [...items.values()].sort((a, b) => storyDate(b).localeCompare(storyDate(a)));
+  }
+
+  function publicStoryFromLegacy(story, user) {
+    const { owner, ...legacy } = story;
+    return normalizeStory({
+      ...legacy,
+      ownerId: user.uid,
+      authorName: user.displayName || state.user?.name || user.email?.split('@')[0] || txt('Traveler', 'مسافر'),
+      isPublished: true,
+      date: storyDate(story) || new Date().toISOString()
+    }, story.id);
+  }
+
+  async function loadPublicStories() {
+    if (!firebaseDb || !firebaseStoreApi) return publicStories;
+    try {
+      const { collection, getDocs } = firebaseStoreApi;
+      const snapshot = await getDocs(collection(firebaseDb, 'stories'));
+      const loaded = [];
+      snapshot.forEach(item => loaded.push(normalizeStory(item.data(), item.id)));
+      publicStories = loaded.sort((a, b) => storyDate(b).localeCompare(storyDate(a)));
+      publicStoriesReady = true;
+      return publicStories;
+    } catch (err) {
+      publicStoriesReady = false;
+      console.warn('Public stories are not available yet:', err);
+      return publicStories;
+    }
+  }
+
+  async function migrateLegacyStories(items, user) {
+    const stories = (items || []).filter(story => story?.id && !story.builtin);
+    if (!stories.length || !firebaseDb || !firebaseStoreApi) return;
+    const { doc, writeBatch } = firebaseStoreApi;
+    const batch = writeBatch(firebaseDb);
+    stories.forEach(story => {
+      const publicStory = publicStoryFromLegacy(story, user);
+      batch.set(doc(firebaseDb, 'stories', publicStory.id), publicStory, { merge: true });
+    });
+    await batch.commit();
+  }
+
+  async function publishStoryToCommunity(story) {
+    if (!state.user || !firebaseDb || !firebaseStoreApi) throw new Error('Cloud service is not ready.');
+    const { doc, setDoc } = firebaseStoreApi;
+    const publicStory = normalizeStory({
+      ...story,
+      ownerId: state.user.id,
+      authorName: state.user.name || state.user.email.split('@')[0] || txt('Traveler', 'مسافر'),
+      isPublished: true
+    }, story.id);
+    await setDoc(doc(firebaseDb, 'stories', publicStory.id), publicStory);
+    publicStories = [publicStory, ...publicStories.filter(item => item.id !== publicStory.id)];
+    state.stories = [publicStory, ...state.stories.filter(item => item.id !== publicStory.id)];
+    saveLocalOnly();
+    return publicStory;
+  }
+
+  async function deleteStoryFromCommunity(storyId) {
+    if (!state.user || !firebaseDb || !firebaseStoreApi) return;
+    const story = communityStories().find(item => item.id === storyId);
+    if (!ownsStory(story)) throw new Error('You can only delete your own story.');
+    await firebaseStoreApi.deleteDoc(firebaseStoreApi.doc(firebaseDb, 'stories', storyId));
+    publicStories = publicStories.filter(item => item.id !== storyId);
+    state.stories = state.stories.filter(item => item.id !== storyId);
+    saveLocalOnly();
+  }
+
+  async function deleteMyPublicStories() {
+    if (!state.user || !firebaseDb || !firebaseStoreApi) return;
+    const mine = publicStories.filter(story => ownsStory(story));
+    if (!mine.length) return;
+    const { doc, writeBatch } = firebaseStoreApi;
+    const batch = writeBatch(firebaseDb);
+    mine.forEach(story => batch.delete(doc(firebaseDb, 'stories', story.id)));
+    await batch.commit();
+    publicStories = publicStories.filter(story => !ownsStory(story));
+  }
+  function cloudSafe(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+  }
+  function queueCloudSave() {
+    if (!state.user || !firebaseDb || !firebaseStoreApi || cloudHydrating) return;
+    clearTimeout(cloudSaveTimer);
+    cloudSaveTimer = setTimeout(() => syncCloudState().catch(err => {
+      cloudSyncState = 'error';
+      console.error('Firestore sync failed:', err);
+      toast(txt('Cloud sync failed. Your changes are still saved on this device.', 'فشل الحفظ السحابي. ما زالت تغييراتك محفوظة على هذا الجهاز.'));
+    }), 550);
+  }
+  function save() {
+    saveLocalOnly();
+    queueCloudSave();
+  }
+  async function syncNamedCollection(name, items) {
+    if (!state.user || !firebaseDb || !firebaseStoreApi) return;
+    const { collection, getDocs, doc, writeBatch } = firebaseStoreApi;
+    const col = collection(firebaseDb, 'users', state.user.id, name);
+    const snap = await getDocs(col);
+    const wanted = new Map((items || []).filter(x => x && x.id).map(x => [String(x.id), cloudSafe(x)]));
+    const batch = writeBatch(firebaseDb);
+    snap.forEach(d => { if (!wanted.has(d.id)) batch.delete(d.ref); });
+    wanted.forEach((value, key) => batch.set(doc(firebaseDb, 'users', state.user.id, name, key), value));
+    await batch.commit();
+  }
+  async function syncCloudState() {
+    if (!state.user || !firebaseDb || !firebaseStoreApi || cloudHydrating) return;
+    cloudSyncState = 'syncing';
+    const { doc, setDoc, serverTimestamp } = firebaseStoreApi;
+    const userRef = doc(firebaseDb, 'users', state.user.id);
+    await setDoc(userRef, {
+      profile: { name: state.user.name || '', email: state.user.email || '' },
+      visited: cloudSafe(state.visited || {}),
+      manualDraft: cloudSafe(state.manualDraft || ['amman']),
+      currentPlan: cloudSafe(state.currentPlan),
+      activeTrip: cloudSafe(state.activeTrip),
+      activeStopIndex: Number(state.activeStopIndex || 0),
+      activeStartedAt: state.activeStartedAt || null,
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+    await syncNamedCollection('trips', state.trips);
+    cloudSyncState = 'synced';
+  }
+  async function loadCloudState(user, migrateLocal) {
+    if (!firebaseDb || !firebaseStoreApi) return;
+    cloudHydrating = true;
+    cloudSyncState = 'syncing';
+    const localStories = migrateLocal ? [...state.stories] : [];
+    try {
+      const { doc, getDoc, collection, getDocs } = firebaseStoreApi;
+      const [userSnap, tripsSnap, legacyStoriesSnap] = await Promise.all([
+        getDoc(doc(firebaseDb, 'users', user.uid)),
+        getDocs(collection(firebaseDb, 'users', user.uid, 'trips')),
+        getDocs(collection(firebaseDb, 'users', user.uid, 'stories'))
+      ]);
+
+      const data = userSnap.exists() ? userSnap.data() : {};
+      const trips = [];
+      tripsSnap.forEach(item => trips.push(item.data()));
+      const legacyStories = [];
+      legacyStoriesSnap.forEach(item => legacyStories.push(item.data()));
+      const hasCloud = userSnap.exists() || !tripsSnap.empty || !legacyStoriesSnap.empty;
+
+      if (hasCloud) {
+        state.trips = trips;
+        state.visited = data.visited && typeof data.visited === 'object' ? data.visited : {};
+        state.manualDraft = Array.isArray(data.manualDraft) ? data.manualDraft : ['amman'];
+        state.currentPlan = data.currentPlan || null;
+        state.activeTrip = data.activeTrip || null;
+        state.activeStopIndex = Number(data.activeStopIndex || 0);
+        state.activeStartedAt = data.activeStartedAt || null;
+      } else if (!migrateLocal) {
+        clearUserScopedState();
+      }
+
+      state.user = {
+        id: user.uid,
+        name: user.displayName || data.profile?.name || state.user?.name || '',
+        email: user.email || data.profile?.email || state.user?.email || ''
+      };
+
+      const migrationMap = new Map();
+      [...legacyStories, ...localStories].forEach(story => { if (story?.id) migrationMap.set(story.id, story); });
+      if (migrationMap.size) {
+        try {
+          await migrateLegacyStories([...migrationMap.values()], user);
+          await loadPublicStories();
+        } catch (err) {
+          console.warn('Could not migrate older stories to the community feed:', err);
+        }
+      } else {
+        await loadPublicStories();
+      }
+
+      const ownPublic = publicStories.filter(story => ownsStory(story));
+      state.stories = publicStoriesReady ? ownPublic : [...migrationMap.values()];
+      saveLocalOnly();
+    } catch (err) {
+      cloudSyncState = 'error';
+      console.error('Cloud data load failed:', err);
+      toast(txt('Could not load your cloud data. Local data is still available.', 'تعذر تحميل بياناتك السحابية. ما زالت البيانات المحلية متاحة.'));
+    } finally {
+      cloudHydrating = false;
+    }
+
+    if (cloudSyncState !== 'error') {
+      if (!migrateLocal) cloudSyncState = 'synced';
+      else await syncCloudState();
+    }
+    render();
+  }
+  function txt(en, ar) { return state.lang === 'ar' ? ar : en; }
+  function ld(d, field) { return state.lang === 'ar' && d.ar?.[field] ? d.ar[field] : d[field]; }
+  function dname(d) { return state.lang === 'ar' ? d.ar : d.name; }
+  function currentRoute() { const r = (location.hash || '#home').slice(1).split('?')[0]; return routes.has(r) ? r : 'home'; }
+  function hashParams() { return new URLSearchParams((location.hash || '').split('?')[1] || ''); }
+  function go(route) { location.hash = route; }
+  function esc(v = '') { return String(v).replace(/[&<>'"]/g, s => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[s])); }
+  function id() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; }
+  function landmarkByKey(key) { return LANDMARKS[key] || LANDMARKS.petra; }
+  function destinationKey() { return hashParams().get('place') || sessionStorage.getItem('tc_destination') || 'petra'; }
+  function toast(msg) { const el = document.getElementById('toast'); if (!el) return; el.textContent = msg; el.classList.add('show'); clearTimeout(window.__toastTimer); window.__toastTimer = setTimeout(() => el.classList.remove('show'), 2300); }
+  function demoBadge() { return `<span class="demo-badge">${txt('Demo data', 'بيانات تجريبية')}</span>`; }
+  function requireUser(returnRoute) { if (state.user) return true; sessionStorage.setItem('tc_return_after_login', returnRoute || currentRoute()); toast(txt('Sign in first to save this item.', 'سجل الدخول أولاً لحفظ هذا العنصر.')); go('login'); return false; }
+  function safeReturnRoute(value) { const route = String(value || '').split('?')[0]; return routes.has(route) && route !== 'login' ? String(value) : ''; }
+  const LANDMARK_UI_AR = {
+    'Registered Landmark': 'معلم مسجل', 'Heritage': 'تراث', 'Walking Destination': 'وجهة للمشي', 'Adventure': 'مغامرة', 'Desert Experience': 'تجربة صحراوية', 'Wellness': 'استجمام', 'Shore Experience': 'تجربة شاطئية',
+    'From Amman': 'من عمّان', 'Typical Drive': 'وقت القيادة المعتاد', 'Experience': 'التجربة', 'Rating': 'التقييم',
+    '≈ 236 km': '≈ 236 كم', '≈ 3h 10m': '≈ 3 س 10 د', 'History · Hiking': 'تاريخ · مشي',
+    '≈ 320 km': '≈ 320 كم', '≈ 4h': '≈ 4 س', 'Desert · Adventure': 'صحراء · مغامرة',
+    '≈ 55 km': '≈ 55 كم', '≈ 1h': '≈ 1 س', 'Wellness · Relaxation': 'استجمام · راحة'
+  };
+  function lui(value) { return state.lang === 'ar' ? (LANDMARK_UI_AR[value] || value) : value; }
+  async function hashPassword(text) {
+    if (!crypto?.subtle) return btoa(unescape(encodeURIComponent(text)));
+    const data = new TextEncoder().encode(text); const digest = await crypto.subtle.digest('SHA-256', data); return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  const navItems = () => [['home', txt('Home', 'الرئيسية')], ['explore', txt('Explore', 'استكشف')], ['plan', txt('Plan Trip', 'خطط الرحلة')], ['scan', txt('Scan Landmark', 'امسح معلماً')], ['stories', txt('Stories', 'القصص')], ['passport', txt('Jordan Passport', 'جواز الأردن')], ['profile', txt('Profile', 'حسابي')]];
+  function activeGroup(route) { if (['plan', 'ai-planner', 'itinerary', 'manual-planner', 'live-trip'].includes(route)) return 'plan'; if (route === 'scan-result') return 'scan'; if (['share-story', 'story'].includes(route)) return 'stories'; if (['login', 'my-trips', 'settings'].includes(route)) return 'profile'; if (route === 'destination' || route === 'results') return 'explore'; return route; }
+  function header(route) { const group = activeGroup(route); return `<header class="header"><button class="mobile-lang" style="display:none" data-action="lang">${state.lang === 'en' ? 'EN / AR' : 'AR / EN'}</button><a class="brand" href="#home" aria-label="Tourism Compass home"><img class="brand-mark brand-logo" src="assets/logo-tourism-compass.png" alt="Tourism Compass logo" /><div class="brand-name">TOURISM COMPASS</div></a><nav class="nav"><button class="lang-btn" data-action="lang">${state.lang === 'en' ? 'EN / AR' : 'AR / EN'}</button>${navItems().map(([r, label]) => `<a href="#${r}" class="nav-link ${group === r ? 'active' : ''}">${label}</a>`).join('')}</nav></header>`; }
+  function bottomNav(route) { const group = activeGroup(route); const items = [['home', txt('Home', 'الرئيسية')], ['explore', txt('Explore', 'استكشف')], ['plan', txt('Plan', 'خطط')], ['scan', txt('Scan', 'امسح')], ['profile', txt('Profile', 'حسابي')]]; return `<nav class="bottom-nav">${items.map(([r, l]) => `<a href="#${r}" class="bottom-link ${group === r ? 'active' : ''}"><span class="dot">${group === r ? '●' : '○'}</span><span>${l}</span></a>`).join('')}</nav>`; }
+  function shell(content) { const route = currentRoute(); document.documentElement.lang = state.lang === 'ar' ? 'ar' : 'en'; document.documentElement.dir = state.lang === 'ar' ? 'rtl' : 'ltr'; return `<div class="app-shell ${state.lang === 'ar' ? 'arabic' : ''}">${header(route)}${content}${bottomNav(route)}</div>`; }
+  function page(title, subtitle, inner) { const showBack = currentRoute() !== 'home'; const back = showBack ? `<div class="page-back-row"><button class="page-back-btn" type="button" data-action="back" aria-label="${txt('Back to previous page', 'الرجوع إلى الصفحة السابقة')}"><span class="back-arrow" aria-hidden="true">${state.lang === 'ar' ? '→' : '←'}</span><span>${txt('Back', 'رجوع')}</span></button></div>` : ''; return `<main class="page"><div class="content">${back}<h1>${title}</h1>${subtitle ? `<p class="subtitle">${subtitle}</p>` : ''}${inner}</div></main>`; }
+  function stat(label, value, cls = '', demo = false) { return `<div class="stat"><small>${label}${demo ? ` ${demoBadge()}` : ''}</small><strong class="${cls}">${value}</strong></div>`; }
+  function card(title, copy, route, klass = '') { return `<a href="#${route}" class="card ${klass}"><div class="card-title">${title}</div><div class="card-copy">${copy}</div><div class="card-action">${txt('View details →', 'عرض التفاصيل ←')}</div></a>`; }
+  function chip(label, active = false, extra = '') { return `<button type="button" class="chip ${active ? 'active' : ''} ${extra}">${label}</button>`; }
+
+  function home() {
+    return page(txt('Discover Jordan Your Way', 'اكتشف الأردن بطريقتك'), txt('Places, planning, safety, and authentic experiences in one place.', 'أماكن وتخطيط وسلامة وتجارب أصيلة في مكان واحد.'), `
+    <section class="hero"><h2>${txt('From Petra to Hidden Villages', 'من البتراء إلى القرى المخفية')}</h2><p>${txt('Plan your journey with smart tools. Live data connections will be added later.', 'خطط رحلتك بأدوات ذكية، وسيتم ربط البيانات الحية لاحقاً.')}</p></section>
+    <section class="stats">${stat(txt('Weather', 'الطقس'), '24° · Ideal', 'good', true)}${stat(txt('Roads', 'الطرق'), txt('Open', 'مفتوحة'), 'good', true)}${stat(txt('Crowd Level', 'الازدحام'), txt('Moderate', 'متوسط'), 'warn', true)}${stat(txt('Registered', 'المسجل'), txt('3 landmarks', '3 معالم'), 'accent')}</section>
+    <h2>${txt('Start Here', 'ابدأ من هنا')}</h2><p class="subtitle">${txt('Choose what you need right now.', 'اختر ما تحتاجه الآن.')}</p>
+    <section class="cards">${card(txt('Search Destinations', 'ابحث عن وجهة'), txt('Filter the registered destinations and open their full guides.', 'ابحث في الوجهات المسجلة وافتح الدليل الكامل.'), 'results')}${card(txt('Explore Jordan', 'استكشف الأردن'), txt('History, nature, culture, faith, and wellness.', 'التاريخ والطبيعة والثقافة والسياحة الدينية والاستجمام.'), 'explore', 'olive-soft')}${card(txt('Plan My Trip', 'خطط رحلتي'), txt('Generate a smart plan or build your own.', 'أنشئ خطة ذكية أو ابنِ رحلتك بنفسك.'), 'plan', 'peach')}${card(txt('Scan & Learn', 'امسح وتعلّم'), txt('On a phone, one photo can identify a registered landmark.', 'على الهاتف يمكن لصورة واحدة التعرف على معلم مسجل.'), 'scan')}${card(txt('Traveler Stories', 'قصص المسافرين'), txt('Read traveler stories or publish your own story to your account.', 'اقرأ قصص المسافرين أو انشر قصتك واحفظها في حسابك.'), 'stories')}${card(txt('Jordan Passport', 'جواز الأردن'), txt('Collect stamps when you visit or scan landmarks.', 'اجمع الأختام عند زيارة المعالم أو مسحها.'), 'passport')}</section>`);
+  }
+
+  function explore() {
+    const data = [
+      ['history', txt('History & Heritage', 'التاريخ والتراث'), txt('Petra, Jerash, and historic castles.', 'البتراء وجرش والقلاع التاريخية.'), 'peach'],
+      ['adventure', txt('Nature & Adventure', 'الطبيعة والمغامرة'), txt('Wadi Rum, reserves, and trails.', 'وادي رم والمحميات والمسارات.'), 'olive-soft'],
+      ['food', txt('Culture & Food', 'الثقافة والطعام'), txt('Markets, crafts, and local cuisine.', 'الأسواق والحرف والمطبخ المحلي.'), ''],
+      ['religious', txt('Religious Tourism', 'السياحة الدينية'), txt('Mount Nebo, Madaba, and heritage sites.', 'جبل نيبو ومادبا والمواقع التراثية.'), ''],
+      ['wellness', txt('Wellness & Relaxation', 'الاستجمام والعافية'), txt('Dead Sea, spas, and quiet retreats.', 'البحر الميت والمنتجعات والاسترخاء.'), 'olive-soft'],
+      ['photography', txt('Photography', 'التصوير'), txt('Landscapes, heritage, and scenic viewpoints.', 'مناظر طبيعية وتراث ونقاط تصوير.'), 'peach']
+    ]; return page(txt('Explore by Experience', 'استكشف حسب التجربة'), txt('Choose a category to filter the smart destination list.', 'اختر فئة لتصفية قائمة الوجهات الذكية.'), `<div class="prototype-note"><strong>${txt('Current stage:', 'المرحلة الحالية:')}</strong> ${txt('weather, crowds, maps, and road safety are demo values. Navigation and planning logic are functional.', 'الطقس والازدحام والخريطة وأمان الطرق بيانات تجريبية، بينما التنقل والتخطيط يعملان فعلياً.')}</div><section class="cards">${data.map(([tag, t, c, k]) => `<a href="#results?interest=${tag}" class="card ${k}"><span class="chip active" style="align-self:flex-start">${t}</span><div class="card-copy">${c}</div><div class="card-action">${txt('Show matching destinations →', 'عرض الوجهات المناسبة ←')}</div></a>`).join('')}</section>`);
+  }
+
+  function results() {
+    const interest = hashParams().get('interest') || 'all'; return page(txt('Destination Results', 'نتائج الوجهات'), txt('Search and filter the registered landmark guides.', 'ابحث وصفِّ أدلة المعالم المسجلة.'), `
+    <div class="search-row"><input id="destination-search" class="input" placeholder="${txt('Search Petra, Wadi Rum, Dead Sea...', 'ابحث: البتراء، وادي رم، البحر الميت...')}"/><span>${demoBadge()}</span></div>
+    <div class="map-box" aria-label="Demo results map"><span class="map-pin"></span><span class="map-label">${txt('Interactive map — demo for now', 'خريطة تفاعلية — تجريبية حالياً')}</span></div>
+    <div class="chips"><button class="chip ${interest === 'all' ? 'active' : ''}" data-result-filter="all">${txt('All', 'الكل')}</button><button class="chip" data-result-filter="near">${txt('Nearby', 'قريب')}</button><button class="chip green" data-result-filter="open">${txt('Open', 'مفتوح')}</button><button class="chip" data-result-filter="quiet">${txt('Quiet', 'أقل ازدحاماً')}</button></div>
+    <section class="cards" id="result-cards">
+      <a href="#destination?place=petra" class="card peach result-card" data-name="petra البتراء" data-tags="all open near history photography"><div class="result-image petra" aria-hidden="true"></div><span class="chip active" style="align-self:flex-start">${txt('Top Pick', 'اختيار مميز')}</span><div class="card-title">${ld(LANDMARKS.petra, 'name')}</div><div class="card-copy">${txt('Open · Moderate crowds · 4.9', 'مفتوح · ازدحام متوسط · 4.9')} ${demoBadge()}</div><div class="card-action">${txt('Open Petra guide →', 'فتح دليل البتراء ←')}</div></a>
+      <a href="#destination?place=wadi-rum" class="card olive-soft result-card" data-name="wadi rum وادي رم" data-tags="all open quiet adventure photography"><div class="result-image wadi-rum" aria-hidden="true"></div><div class="card-title">${ld(LANDMARKS['wadi-rum'], 'name')}</div><div class="card-copy">${txt('Great weather · Adventure · 4.8', 'طقس مناسب · مغامرة · 4.8')} ${demoBadge()}</div><div class="card-action">${txt('Open Wadi Rum guide →', 'فتح دليل وادي رم ←')}</div></a>
+      <a href="#destination?place=dead-sea" class="card result-card" data-name="dead sea البحر الميت" data-tags="all near wellness photography"><div class="result-image dead-sea" aria-hidden="true"></div><div class="card-title">${ld(LANDMARKS['dead-sea'], 'name')}</div><div class="card-copy">${txt('Wellness · 31° · 4.7', 'استجمام · 31° · 4.7')} ${demoBadge()}</div><div class="card-action">${txt('Open Dead Sea guide →', 'فتح دليل البحر الميت ←')}</div></a>
+    </section>`);
+  }
+
+  function landmarkOverview(d) { return `<section class="landmark-overview"><div class="overview-main"><span class="eyebrow">${esc(ld(d, 'category'))} · ${esc(ld(d, 'region'))}</span><h2>${txt('About', 'عن')} ${esc(ld(d, 'name'))}</h2><p>${esc(ld(d, 'about'))}</p></div><div class="recognition-card"><span class="recognition-icon">◎</span><div><strong>${txt('How Scan & Learn recognizes it', 'كيف يتعرف عليه المسح الذكي')}</strong><p>${esc(ld(d, 'recognition'))}</p></div></div></section>`; }
+  function landmarkExperiences(d) { const arr = state.lang === 'ar' && d.ar?.experiences ? d.ar.experiences : d.experiences; return `<section class="landmark-section"><div class="section-heading"><div><span class="eyebrow">${txt('Smart guide', 'الدليل الذكي')}</span><h2>${txt('Top Experiences', 'أفضل التجارب')}</h2></div></div><div class="experience-grid">${arr.map((x, i) => `<article class="experience-card"><span>${String(i + 1).padStart(2, '0')}</span><strong>${esc(x)}</strong></article>`).join('')}</div></section>`; }
+  function landmarkTips(d) { const arr = state.lang === 'ar' && d.ar?.tips ? d.ar.tips : d.tips; return `<section class="landmark-section"><div class="section-heading"><div><span class="eyebrow">${txt('Before you go', 'قبل أن تذهب')}</span><h2>${txt('Useful Tips', 'نصائح مفيدة')}</h2></div></div><div class="tip-list">${arr.map(x => `<div class="tip-item"><span>✓</span><p>${esc(x)}</p></div>`).join('')}</div></section>`; }
+  function destination() {
+    const d = landmarkByKey(destinationKey()); sessionStorage.setItem('tc_destination', d.key); const visited = !!state.visited[d.key]; return page(esc(ld(d, 'destinationTitle')), esc(ld(d, 'destinationSubtitle')), `
+    <div class="media-hero landmark-hero ${d.hero}" aria-label="${esc(ld(d, 'name'))}"><span>${esc(ld(d, 'name'))}</span></div>
+    <div class="chips">${d.chips.map(([label, klass]) => chip(lui(label), false, klass)).join('')} ${visited ? `<span class="chip green">✓ ${txt('Visited', 'تمت الزيارة')}</span>` : ''}</div>
+    <section class="stats">${d.stats.map(([label, value, klass], i) => stat(lui(label), lui(value), klass, i < 2)).join('')}</section>
+    ${landmarkOverview(d)}${landmarkExperiences(d)}
+    <section class="landmark-section"><div class="section-heading"><div><span class="eyebrow">${txt('Plan the visit', 'خطط للزيارة')}</span><h2>${txt('Travel Essentials', 'معلومات أساسية')}</h2></div></div><div class="cards">
+      <article class="card"><div class="card-title">${txt('Route', 'الطريق')} ${demoBadge()}</div><div class="card-copy">${esc(ld(d, 'route'))}</div></article>
+      <article class="card"><div class="card-title">${txt('Transport', 'المواصلات')}</div><div class="card-copy">${esc(ld(d, 'transport'))}</div></article>
+      <article class="card"><div class="card-title">${txt('Stay', 'الإقامة')}</div><div class="card-copy">${esc(ld(d, 'hotels'))}</div></article>
+      <article class="card olive-soft"><div class="card-title">${txt('Food', 'الطعام')}</div><div class="card-copy">${esc(ld(d, 'restaurants'))}</div></article>
+      <article class="card"><div class="card-title">${txt('Services', 'الخدمات')}</div><div class="card-copy">${esc(ld(d, 'services'))}</div></article>
+      <article class="card peach"><div class="card-title">${txt('Live status', 'الحالة الحية')} ${demoBadge()}</div><div class="card-copy">${txt('Weather, crowd level, road safety, and live map will be connected later.', 'سيتم ربط الطقس والازدحام وأمان الطرق والخريطة الحية لاحقاً.')}</div></article>
+    </div></section>${landmarkTips(d)}
+    <div class="btn-row"><button class="btn" data-action="add-landmark" data-landmark="${d.key}">${txt('Add to My Trip', 'أضف إلى رحلتي')}</button><button class="btn olive" data-action="toggle-visited" data-landmark="${d.key}">${visited ? txt('Remove Visit', 'إلغاء الزيارة') : txt('Mark as Visited', 'تسجيل كزيارة')}</button><a class="btn secondary" href="#scan">${txt('Scan Another Landmark', 'امسح معلماً آخر')}</a></div>`);
+  }
+
+  function plan() { return page(txt('How Would You Like to Plan?', 'كيف تريد تخطيط رحلتك؟'), txt('Choose a smart itinerary or build your own.', 'اختر خطة ذكية أو ابنِ رحلتك بنفسك.'), `<section class="planner-options"><a href="#ai-planner" class="option-card featured"><span class="chip active badge">${txt('Recommended', 'موصى به')}</span><h2>${txt('Smart Itinerary', 'التخطيط الذكي')}</h2><p class="card-copy">${txt('Duration, interests, budget, and travelers change the generated route.', 'المدة والاهتمامات والميزانية وعدد المسافرين تغير المسار المقترح فعلياً.')}</p><span class="card-action">${txt('Build smart plan →', 'إنشاء خطة ذكية ←')}</span></a><a href="#manual-planner" class="option-card"><h2>${txt('Build It Myself', 'أخطط بنفسي')}</h2><p class="card-copy">${txt('Add destinations, reorder them, save, and start the trip.', 'أضف الوجهات ورتبها واحفظ الرحلة وابدأها.')}</p><span class="card-action">${txt('Open manual planner →', 'فتح التخطيط اليدوي ←')}</span></a></section>`); }
+
+  function aiPlanner() {
+    return page(txt('Build Your Smart Trip', 'أنشئ رحلتك الذكية'), txt('The route is generated locally now; live traffic/weather APIs come later.', 'يتم إنشاء المسار محلياً الآن، وسيتم ربط الطقس والطرق الحية لاحقاً.'), `
+    <div class="field"><label>${txt('Interests', 'الاهتمامات')}</label><div class="chips" id="interest-chips"><button type="button" class="chip active" data-interest="history">${txt('History', 'تاريخ')}</button><button type="button" class="chip active" data-interest="adventure">${txt('Adventure', 'مغامرة')}</button><button type="button" class="chip" data-interest="food">${txt('Food', 'طعام')}</button><button type="button" class="chip" data-interest="photography">${txt('Photography', 'تصوير')}</button><button type="button" class="chip" data-interest="wellness">${txt('Wellness', 'استجمام')}</button><button type="button" class="chip" data-interest="religious">${txt('Religious', 'ديني')}</button></div></div>
+    <form id="ai-form" class="form"><div class="field"><label>${txt('Trip Duration', 'مدة الرحلة')}</label><select class="select" name="duration"><option value="3">3 ${txt('days', 'أيام')}</option><option value="4" selected>4 ${txt('days', 'أيام')}</option><option value="5">5 ${txt('days', 'أيام')}</option><option value="7">7 ${txt('days', 'أيام')}</option></select></div><div class="field"><label>${txt('Starting Point', 'نقطة البداية')}</label><select class="select" name="start"><option value="amman">${txt('Amman', 'عمّان')}</option><option value="aqaba">${txt('Aqaba', 'العقبة')}</option><option value="dead-sea">${txt('Dead Sea', 'البحر الميت')}</option></select></div><div class="field"><label>${txt('Budget', 'الميزانية')}</label><select class="select" name="budget"><option value="moderate">${txt('Moderate', 'متوسطة')}</option><option value="budget">${txt('Budget', 'اقتصادية')}</option><option value="premium">${txt('Premium', 'مرتفعة')}</option></select></div><div class="field"><label>${txt('Travelers', 'المسافرون')}</label><select class="select" name="travelers"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option><option value="5">5+</option></select></div><div class="btn-row"><button class="btn" type="submit">${txt('Create My Itinerary', 'أنشئ خطتي')}</button></div></form>`);
+  }
+
+  function buildSmartPlan(form, interests) {
+    const duration = Math.min(7, Math.max(1, Number(form.duration) || 4));
+    const start = form.start || 'amman', budget = form.budget || 'moderate', travelers = Math.max(1, Number(form.travelers) || 2);
+    const chosenInterests = [...new Set((interests || []).filter(Boolean))];
+    const keys = Object.keys(DESTINATIONS);
+    const budgetProfile = { budget: { multiplier: .78, target: 45 }, moderate: { multiplier: 1, target: 65 }, premium: { multiplier: 1.45, target: 95 } }[budget] || { multiplier: 1, target: 65 };
+    const selected = [start];
+    const remaining = new Set(keys.filter(k => k !== start));
+    const covered = new Set(DESTINATIONS[start]?.tags.filter(t => chosenInterests.includes(t)) || []);
+
+    while (selected.length < duration && remaining.size) {
+      const current = selected[selected.length - 1];
+      let best = null;
+      for (const key of remaining) {
+        const d = DESTINATIONS[key];
+        const matched = d.tags.filter(t => chosenInterests.includes(t));
+        const newMatches = matched.filter(t => !covered.has(t)).length;
+        const interestScore = matched.length * 8 + newMatches * 4;
+        const budgetGap = Math.abs(d.cost - budgetProfile.target);
+        const budgetScore = Math.max(-6, 6 - budgetGap / 7);
+        const routePenalty = travelHours(current, key) * 2.4;
+        const landmarkBonus = d.landmark ? 1.2 : 0;
+        const score = interestScore + budgetScore + landmarkBonus - routePenalty;
+        if (!best || score > best.score) best = { key, score, matched };
+      }
+      if (!best) break;
+      selected.push(best.key); remaining.delete(best.key); best.matched.forEach(t => covered.add(t));
+    }
+
+    const stops = selected.map((key, i) => { const d = DESTINATIONS[key]; const leg = i ? travelHours(selected[i - 1], key) : 0; return { key, name: d.name, ar: d.ar, description: d.desc, descriptionAr: d.descAr, landmark: d.landmark || null, day: i + 1, travelFromPrevious: Math.round(leg * 10) / 10, matchedInterests: d.tags.filter(t => chosenInterests.includes(t)) }; });
+    const estimate = Math.round(stops.reduce((sum, s) => sum + (DESTINATIONS[s.key]?.cost || 0), 0) * budgetProfile.multiplier * travelers);
+    const driving = Math.round(stops.reduce((sum, s) => sum + (s.travelFromPrevious || 0), 0) * 10) / 10;
+    const matchedAll = new Set(stops.flatMap(s => s.matchedInterests || []));
+    const fit = chosenInterests.length ? Math.round((matchedAll.size / chosenInterests.length) * 100) : 100;
+    return { id: id(), type: 'smart', name: txt(`${duration}-Day Smart Jordan Trip`, `رحلة ذكية في الأردن لمدة ${duration} أيام`), duration, start, budget, travelers, interests: chosenInterests, stops, estimate, driving, fit, created: new Date().toISOString(), progressIndex: 0 };
+  }
+
+  function itinerary() {
+    const p = state.currentPlan || buildSmartPlan({ duration: 4, start: 'amman', budget: 'moderate', travelers: 2 }, ['history', 'adventure']);
+    const alreadySaved = !!(state.user && state.trips.some(t => t.id === p.id && (!t.owner || t.owner === state.user.email)));
+    const fit = Number.isFinite(p.fit) ? p.fit : (p.interests?.length ? Math.round(new Set((p.stops || []).flatMap(s => (DESTINATIONS[s.key]?.tags || []).filter(t => p.interests.includes(t)))).size / p.interests.length * 100) : 100);
+    return page(txt(`Your Suggested ${p.duration}-Day Trip`, `رحلتك المقترحة لمدة ${p.duration} أيام`), txt('Generated from your duration, interests, budget, travelers, and route efficiency.', 'تم إنشاؤها حسب المدة والاهتمامات والميزانية وعدد المسافرين وكفاءة المسار.'), `
+    <section class="stats">${stat(txt('Estimated Cost', 'التكلفة التقديرية'), `≈ JOD ${p.estimate}`, 'accent')}${stat(txt('Route Driving', 'قيادة المسار'), `≈ ${formatHours(p.driving)}`, '', true)}${stat(txt('Interest Fit', 'توافق الاهتمامات'), `${fit}%`, 'good')}${stat(txt('Travelers', 'المسافرون'), String(p.travelers || 1))}</section>
+    <div class="callout smart-plan-note"><h3>${txt('Why this route?', 'لماذا هذا المسار؟')}</h3><p>${txt('The planner gives more weight to your selected interests, keeps the starting point first, considers the chosen budget level, and reduces unnecessary driving between consecutive stops.', 'يعطي المخطط وزناً أكبر لاهتماماتك، ويثبت نقطة البداية أولاً، ويراعي مستوى الميزانية، ويقلل القيادة غير الضرورية بين المحطات المتتالية.')}</p></div>
+    <section class="timeline">${p.stops.map((s, i) => timeline(i + 1, s, p.stops[i - 1])).join('')}</section>
+    <div class="prototype-note"><strong>${txt('Planning note:', 'ملاحظة التخطيط:')}</strong> ${txt('cost and inter-city driving are local planning estimates. Live traffic, road conditions, crowds, and weather will be connected later.', 'التكلفة ووقت القيادة بين المدن تقديرات محلية للتخطيط، وسيتم ربط المرور وحالة الطرق والازدحام والطقس بخدمات حية لاحقاً.')}</div>
+    <div class="btn-row"><button class="btn" data-action="start-plan">${txt('Start Trip', 'ابدأ الرحلة')}</button><button class="btn secondary" data-action="save-itinerary" ${alreadySaved ? 'disabled' : ''}>${alreadySaved ? txt('Saved', 'محفوظة') : txt('Save Trip', 'احفظ الرحلة')}</button><a href="#ai-planner" class="btn secondary">${txt('Edit Inputs', 'تعديل المدخلات')}</a></div>`);
+  }
+  function timeline(n, s, prev) {
+    const d = DESTINATIONS[s.key];
+    const name = stopName(s), desc = state.lang === 'ar' ? (s.descriptionAr || d?.descAr || s.description) : (s.description || d?.desc || '');
+    const leg = Number.isFinite(s.travelFromPrevious) ? s.travelFromPrevious : (prev ? travelHours(prev.key, s.key) : 0);
+    const travel = prev ? `<div class="timeline-travel">↳ ${txt('Approx. from previous stop', 'تقريباً من المحطة السابقة')}: <strong>${formatHours(leg)}</strong></div>` : '';
+    const details = s.landmark ? `<a class="btn small secondary" href="#destination?place=${s.landmark}">${txt('Details', 'التفاصيل')}</a>` : '';
+    return `<div class="timeline-item"><div class="day-num">${n}</div><div><h3>${txt('Day', 'اليوم')} ${n} — ${esc(name)}</h3><p class="card-copy">${esc(desc)}</p>${travel}</div>${details}</div>`;
+  }
+
+  function manualPlanner() {
+    const list = state.manualDraft.map(k => DESTINATIONS[k] || { key: k, name: k, ar: k, desc: 'Custom stop', descAr: 'محطة مخصصة' }); return page(txt('Build Your Own Trip', 'ابنِ رحلتك بنفسك'), txt('Add, remove, and reorder destinations.', 'أضف الوجهات واحذفها ورتبها.'), `
+    <div class="field" style="margin-bottom:18px"><label>${txt('Add Destination', 'إضافة وجهة')}</label><div class="manual-add-row"><select id="manual-search" class="select">${Object.values(DESTINATIONS).filter(d => !state.manualDraft.includes(d.key)).map(d => `<option value="${d.key}">${esc(dname(d))}</option>`).join('')}</select><button class="btn small" data-action="manual-add">${txt('Add', 'إضافة')}</button></div></div>
+    <section class="timeline" id="manual-list">${list.map((d, i) => `<div class="list-card"><span class="drag">⋮⋮</span><div class="list-main"><h3>${i + 1} — ${esc(dname(d))}</h3><p>${esc(state.lang === 'ar' ? (d.descAr || 'محطة ضمن الرحلة') : (d.desc || 'Trip stop'))}</p></div><div class="reorder-actions"><button class="icon-btn" data-manual-move="up" data-index="${i}" ${i === 0 ? 'disabled' : ''}>↑</button><button class="icon-btn" data-manual-move="down" data-index="${i}" ${i === list.length - 1 ? 'disabled' : ''}>↓</button><button class="icon-btn danger" data-remove-manual="${i}">×</button></div></div>`).join('') || `<div class="empty-note">${txt('Add your first destination.', 'أضف أول وجهة إلى الرحلة.')}</div>`}</section>
+    <div class="btn-row" style="margin-top:18px"><button class="btn" data-action="manual-start">${txt('Start Trip', 'ابدأ الرحلة')}</button><button class="btn secondary" data-action="save-manual">${txt('Save', 'حفظ')}</button></div>`);
+  }
+  function manualPlanObject() { const stops = state.manualDraft.map((key, i) => { const d = DESTINATIONS[key]; return { key, name: d?.name || key, ar: d?.ar || key, description: d?.desc || 'Custom stop', descriptionAr: d?.descAr || 'محطة مخصصة', landmark: d?.landmark || null, day: i + 1 }; }); return { id: id(), type: 'manual', name: txt('My Custom Jordan Trip', 'رحلتي المخصصة في الأردن'), duration: stops.length, start: stops[0]?.key || 'amman', budget: 'manual', travelers: 1, interests: [], stops, estimate: Math.round(stops.reduce((s, x) => s + (DESTINATIONS[x.key]?.cost || 30), 0)), driving: Math.round(stops.reduce((s, x) => s + (DESTINATIONS[x.key]?.drive || 0), 0) * 10) / 10, created: new Date().toISOString() }; }
+
+  function liveTrip() {
+    const p = state.activeTrip;
+    if (!p?.stops?.length) {
+      const current = state.currentPlan;
+      return page(txt('My Trip Now', 'رحلتي الآن'), txt('Start a plan to activate turn-by-turn trip progress.', 'ابدأ خطة لتفعيل تقدم الرحلة محطة بمحطة.'), `${current?.stops?.length ? `<div class="callout"><h3>${txt('Ready to start', 'جاهزة للبدء')}</h3><p>${esc(current.name || txt('Current trip', 'الرحلة الحالية'))} · ${current.stops.length} ${txt('stops', 'محطات')}</p><button class="btn" data-action="start-current-trip">${txt('Start Current Plan', 'ابدأ الخطة الحالية')}</button></div>` : `<div class="empty-note">${txt('There is no active trip. Create a smart or manual plan first.', 'لا توجد رحلة نشطة. أنشئ خطة ذكية أو يدوية أولاً.')}</div><div class="btn-row" style="margin-top:18px"><a class="btn" href="#plan">${txt('Plan a Trip', 'خطط رحلة')}</a></div>`}`);
+    }
+    const total = p.stops.length, index = Math.min(state.activeStopIndex || 0, total - 1), s = p.stops[index], next = p.stops[index + 1] || null;
+    const completed = index, percent = Math.round((completed / total) * 100), isLast = index === total - 1;
+    const nextLeg = next ? (Number.isFinite(next.travelFromPrevious) ? next.travelFromPrevious : travelHours(s.key, next.key)) : 0;
+    const routeSteps = p.stops.map((stop, i) => `<div class="route-step ${i < index ? 'done' : i === index ? 'current' : 'upcoming'}"><span class="route-step-dot">${i < index ? '✓' : i + 1}</span><div><strong>${esc(stopName(stop))}</strong><small>${i < index ? txt('Completed', 'مكتملة') : i === index ? txt('Current stop', 'المحطة الحالية') : txt('Upcoming', 'قادمة')}</small></div></div>`).join('');
+    return page(txt('My Trip Now', 'رحلتي الآن'), txt('Your trip progress is securely synced to your account as you move between stops.', 'تتم مزامنة تقدم رحلتك بأمان مع حسابك أثناء الانتقال بين المحطات.'), `
+    <section class="trip-progress-panel"><div class="progress-wrap"><div class="progress"><span style="width:${percent}%"></span></div><div class="progress-note"><span>${txt('Trip progress', 'تقدم الرحلة')}</span><strong>${percent}% · ${completed}/${total} ${txt('completed', 'مكتملة')}</strong></div></div><div class="route-progress">${routeSteps}</div></section>
+    <div class="map-box" style="height:310px"><span class="map-pin"></span><span class="map-label">${txt('Live Map — demo', 'الخريطة الحية — تجريبية')} ${demoBadge()}</span></div>
+    <section class="stats">${stat(txt('Current Stop', 'المحطة الحالية'), `${index + 1}/${total}`)}${stat(txt('Progress', 'التقدم'), `${percent}%`, 'good')}${stat(txt('Next Drive', 'القيادة التالية'), next ? `≈ ${formatHours(nextLeg)}` : txt('Final stop', 'المحطة الأخيرة'), '', true)}${stat(txt('Road Status', 'حالة الطريق'), txt('Open', 'مفتوح'), 'good', true)}</section>
+    <div class="two-col"><div class="callout"><span class="eyebrow">${txt('Now', 'الآن')}</span><h3>${esc(stopName(s))}</h3><p>${esc(state.lang === 'ar' ? (s.descriptionAr || s.description) : (s.description || ''))}</p>${s.landmark ? `<div class="card-action" style="margin-top:12px"><a href="#destination?place=${s.landmark}">${txt('Open guide →', 'فتح الدليل ←')}</a></div>` : ''}</div><div class="callout peach"><span class="eyebrow">${txt('Next', 'التالي')}</span>${next ? `<h3>${esc(stopName(next))}</h3><p>${txt('Estimated planning drive', 'وقت القيادة التقديري')}: ${formatHours(nextLeg)}. ${esc(state.lang === 'ar' ? (next.descriptionAr || next.description) : (next.description || ''))}</p>` : `<h3>${txt('Final stop', 'المحطة الأخيرة')}</h3><p>${txt('Complete this stop to finish the trip and unlock any registered landmark stamp.', 'أكمل هذه المحطة لإنهاء الرحلة وفتح ختم المعلم المسجل إن وجد.')}</p>`}</div></div>
+    <div class="callout live-status-card"><h3>${txt('Safety & Weather', 'السلامة والطقس')} ${demoBadge()}</h3><p>${txt('Demo status: route open, mild conditions, and no active safety alert. Live services will replace this placeholder later.', 'الحالة التجريبية: الطريق مفتوح والظروف معتدلة ولا يوجد تنبيه سلامة نشط. سيتم استبدالها بخدمات حية لاحقاً.')}</p></div>
+    <div class="btn-row"><button class="btn" data-action="complete-stop">${isLast ? txt('Finish Trip', 'إنهاء الرحلة') : txt('Complete Stop & Continue', 'إنهاء المحطة والمتابعة')}</button><button class="btn secondary" data-action="restart-trip">${txt('Restart Trip', 'إعادة الرحلة')}</button><a class="btn secondary" href="#my-trips">${txt('My Trips', 'رحلاتي')}</a></div>`);
+  }
+
+
+  function scan() { return page(txt('Scan & Learn', 'امسح وتعلّم'), txt('Use your phone camera to recognize Petra, Wadi Rum, or the Dead Sea.', 'استخدم كاميرا الهاتف للتعرف على البتراء أو وادي رم أو البحر الميت.'), `<section class="mobile-scanner" id="mobile-scanner"><div class="camera live-camera" id="camera-box"><video id="scan-video" autoplay playsinline muted></video><img id="scan-preview" alt="Captured landmark preview"/><div class="camera-frame" aria-hidden="true"></div><div class="camera-status" id="camera-status">${txt('Starting rear camera…', 'تشغيل الكاميرا الخلفية…')}</div></div><canvas id="scan-canvas" class="scan-canvas" aria-hidden="true"></canvas><div class="chips"><span class="chip">${txt('Good Lighting', 'إضاءة جيدة')}</span><span class="chip">${txt('Hold Steady', 'ثبت الهاتف')}</span><span class="chip green">3 ${txt('Registered Landmarks', 'معالم مسجلة')}</span></div><div class="scan-ai-note"><strong>${txt('Smart recognition:', 'التعرف الذكي:')}</strong> ${txt('the captured image is analyzed and routed to the detected landmark guide.', 'يتم تحليل الصورة الملتقطة ونقلك إلى دليل المعلم الذي تم اكتشافه.')}</div><div class="scan-progress" id="scan-progress" hidden><span class="spinner"></span><span id="scan-progress-text">${txt('Analyzing landmark…', 'تحليل المعلم…')}</span></div><div class="btn-row"><button class="btn" id="capture-analyze" data-action="capture-analyze">${txt('Capture & Analyze', 'التقاط وتحليل')}</button><button class="btn secondary" id="retake-scan" data-action="retake" hidden>${txt('Retake', 'إعادة التصوير')}</button><button class="btn secondary" id="enable-camera" data-action="enable-camera" hidden>${txt('Enable Camera', 'تشغيل الكاميرا')}</button></div></section><section class="desktop-scan-note"><div class="callout peach desktop-only-scan"><h3>${txt('Phone Camera Only', 'الكاميرا على الهاتف فقط')}</h3><p>${txt('Scanning is intentionally disabled on computers. Open the same project on a phone over HTTPS to use the rear camera.', 'تم تعطيل المسح على الكمبيوتر عمداً. افتح نفس المشروع على هاتف عبر HTTPS لاستخدام الكاميرا الخلفية.')}</p></div><div class="registered-landmarks">${Object.values(LANDMARKS).map(d => `<a class="mini-landmark ${d.hero}" href="#destination?place=${d.key}"><strong>${esc(ld(d, 'name'))}</strong><span>${txt('Registered landmark', 'معلم مسجل')}</span></a>`).join('')}</div></section>`); }
+
+  function scanResult() { let scanData = null; try { scanData = JSON.parse(sessionStorage.getItem('tc_scan_result') || 'null'); } catch (e) { } const d = landmarkByKey(scanData?.key || hashParams().get('place') || 'petra'); const confidence = Math.round((scanData?.confidence ?? .98) * 100); const captured = scanData?.image || ''; const rows = (scanData?.matches || []).slice(0, 3).map(x => `<div class="match-row"><span>${esc(ld(landmarkByKey(x.key), 'name'))}</span><strong>${Math.round(x.score * 100)}%</strong></div>`).join(''); return page(esc(ld(d, 'scanTitle')), txt(`Image recognition selected ${d.name} with ${confidence}% match confidence.`, `اختار التعرف على الصورة ${ld(d, 'name')} بنسبة مطابقة ${confidence}%.`), `<div class="media-hero landmark-hero scan-result-hero ${d.hero} ${captured ? 'has-captured-photo' : ''}" ${captured ? `style="background-image:url('${captured}')"` : ''}><span>${esc(ld(d, 'name'))}</span></div><div class="recognition-match"><span class="match-dot"></span><div><strong>${txt('Matched', 'تم التعرف')}: ${esc(ld(d, 'name'))}</strong><small>${txt('The information below comes from the landmark detected in this captured image.', 'المعلومات أدناه تخص المعلم الذي تم اكتشافه من الصورة نفسها.')}</small></div></div>${rows ? `<details class="match-details"><summary>${txt('Recognition comparison', 'مقارنة التعرف')}</summary><div>${rows}</div></details>` : ''}<div class="btn-row scan-actions"><button class="btn small olive" data-action="audio" data-landmark="${d.key}">▶ ${txt('Play Audio', 'تشغيل الصوت')}</button><button class="btn small secondary" data-action="read">${txt('Read Information', 'قراءة المعلومات')}</button></div><section id="scan-reading" class="scan-information"><div class="callout"><span class="eyebrow">${txt('Detected landmark', 'المعلم المكتشف')}</span><h3>${esc(ld(d, 'name'))} · ${esc(ld(d, 'region'))}</h3><p>${esc(ld(d, 'about'))}</p></div><div class="callout peach"><span class="eyebrow">${txt('Visual guide', 'الدليل')}</span><h3>${esc(ld(d, 'storyTitle'))}</h3><p>${esc(ld(d, 'story'))}</p></div></section>${landmarkExperiences(d)}${landmarkTips(d)}<div class="btn-row"><a class="btn" href="#destination?place=${d.key}">${txt('Open Full Guide', 'فتح الدليل الكامل')}</a><a class="btn secondary" href="#scan">${txt('Scan Another Landmark', 'امسح معلماً آخر')}</a></div>`); }
+
+  function stories() {
+    const mine = hashParams().get('mine') === '1';
+    if (mine && !state.user) {
+      return page(
+        txt('My Stories', 'قصصي'),
+        txt('Sign in to view your published stories.', 'سجل الدخول لعرض القصص التي نشرتها.'),
+        `<a class="btn" href="#login?return=stories%3Fmine%3D1">${txt('Sign In', 'تسجيل الدخول')}</a>`
+      );
+    }
+
+    const userStories = communityStories();
+    const selected = mine ? userStories.filter(story => ownsStory(story)) : [...BUILTIN_STORIES, ...userStories];
+    const title = mine ? txt('My Stories', 'قصصي') : txt('Traveler Stories', 'قصص المسافرين');
+    const subtitle = mine
+      ? txt('Stories published from this account.', 'القصص المنشورة من هذا الحساب.')
+      : txt('Stories shared by travelers using Tourism Compass.', 'قصص شاركها مسافرون يستخدمون البوصلة السياحية.');
+
+    const cards = selected.length
+      ? `<section class="cards">${selected.map((story, index) => {
+        const author = story.builtin ? 'Tourism Compass' : (story.authorName || txt('Traveler', 'مسافر'));
+        return `<a href="#story?id=${encodeURIComponent(story.id)}${mine ? '&from=mine' : ''}" class="card ${index % 3 === 0 ? 'peach' : index % 3 === 1 ? 'olive-soft' : ''}">
+            ${story.image ? `<img class="story-thumb" src="${story.image}" alt=""/>` : ''}
+            <div class="card-title">${esc(state.lang === 'ar' ? (story.titleAr || story.title) : story.title)}</div>
+            <div class="card-copy">${esc(state.lang === 'ar' ? (story.locationAr || story.location) : story.location)} · ★ ${esc(story.rating)}</div>
+            <div class="story-author">${txt('By', 'بواسطة')} ${esc(author)}</div>
+            <div class="card-action">${txt('Read story →', 'اقرأ القصة ←')}</div>
+          </a>`;
+      }).join('')}</section>`
+      : `<div class="empty-note">${txt('No stories published from this account yet.', 'لم يتم نشر قصص من هذا الحساب بعد.')}</div>`;
+
+    return page(title, subtitle, `${cards}<div class="btn-row"><a href="#share-story" class="btn">${txt('Share Your Story', 'شارك قصتك')}</a>${mine ? `<a href="#stories" class="btn secondary">${txt('All Stories', 'كل القصص')}</a>` : ''}</div>`);
+  }
+
+  function storyDetail() {
+    const storyId = hashParams().get('id');
+    const fromMine = hashParams().get('from') === 'mine';
+    const story = [...BUILTIN_STORIES, ...communityStories()].find(item => item.id === storyId);
+    const backHref = fromMine ? '#stories?mine=1' : '#stories';
+    if (!story) return page(txt('Story not found', 'القصة غير موجودة'), '', `<a class="btn" href="${backHref}">${txt('Back to Stories', 'العودة للقصص')}</a>`);
+
+    const author = story.builtin ? 'Tourism Compass' : (story.authorName || txt('Traveler', 'مسافر'));
+    const own = !story.builtin && ownsStory(story);
+    return page(
+      esc(state.lang === 'ar' ? (story.titleAr || story.title) : story.title),
+      `${esc(state.lang === 'ar' ? (story.locationAr || story.location) : story.location)} · ★ ${esc(story.rating)} · ${txt('By', 'بواسطة')} ${esc(author)}`,
+      `${story.image ? `<img class="story-detail-image" src="${story.image}" alt=""/>` : ''}<div class="callout"><p>${esc(state.lang === 'ar' ? (story.experienceAr || story.experience) : story.experience)}</p></div><div class="btn-row"><a class="btn secondary" href="${backHref}">${txt('Back', 'رجوع')}</a>${own ? `<button class="btn secondary" data-action="delete-story" data-story="${story.id}" data-story-back="${fromMine ? 'mine' : 'all'}">${txt('Delete Story', 'حذف القصة')}</button>` : ''}</div>`
+    );
+  }
+
+  function shareStory() {
+    if (!state.user) {
+      return page(
+        txt('Sign In to Share', 'سجل الدخول للمشاركة'),
+        txt('Sign in before publishing a traveler story.', 'سجل الدخول قبل نشر قصة للمسافرين.'),
+        `<a class="btn" href="#login?return=share-story">${txt('Sign In / Create Account', 'تسجيل الدخول / إنشاء حساب')}</a>`
+      );
+    }
+    return page(
+      txt('Share Your Journey', 'شارك رحلتك'),
+      txt('Your published story will be visible to other Tourism Compass users.', 'ستظهر قصتك المنشورة لمستخدمي البوصلة السياحية الآخرين.'),
+      `<div id="story-preview" class="story-upload-preview"><span>${txt('Image preview', 'معاينة الصورة')}</span></div><div class="field"><label>${txt('Photo (optional)', 'صورة (اختياري)')}</label><input id="story-image" class="input" type="file" accept="image/*"/></div><div class="rating" id="rating"><button class="active" data-rating="5">★ 5</button><button data-rating="4">★ 4</button><button data-rating="3">★ 3</button></div><form id="story-form" class="form"><div class="field"><label>${txt('Story Title', 'عنوان القصة')}</label><input class="input" name="title" maxlength="90" required/></div><div class="field"><label>${txt('Your Experience', 'تجربتك')}</label><textarea class="textarea" name="experience" maxlength="1500" required placeholder="${txt('What did you enjoy, and what is your advice?', 'ماذا أعجبك وما نصيحتك؟')}"></textarea></div><div class="field"><label>${txt('Location', 'الموقع')}</label><input class="input" name="location" maxlength="80" required/></div><div class="btn-row"><button class="btn" type="submit">${txt('Publish Story', 'نشر القصة')}</button><a class="btn secondary" href="#stories">${txt('Cancel', 'إلغاء')}</a></div></form>`
+    );
+  }
+
+  function passport() { const stamps = Object.values(LANDMARKS); const count = stamps.filter(d => state.visited[d.key]).length; const pct = Math.round(count / stamps.length * 100); return page(txt('Jordan Passport', 'جواز الأردن'), txt('Scanning or marking a landmark as visited unlocks its stamp. You can remove a visit at any time.', 'مسح المعلم أو تسجيله كزيارة يفتح الختم، ويمكنك إلغاء الزيارة في أي وقت.'), `<section class="hero"><h2>${count} ${txt('of', 'من')} ${stamps.length} ${txt('registered stamps', 'أختام مسجلة')}</h2><p>${count === stamps.length ? txt('All current landmark stamps are unlocked.', 'تم فتح جميع أختام المعالم الحالية.') : txt('Visit or scan the remaining landmarks to complete this demo passport.', 'زر أو امسح المعالم المتبقية لإكمال جواز السفر التجريبي.')}</p></section><div class="progress-wrap"><div class="progress"><span style="width:${pct}%"></span></div><div class="progress-note"><span>${count} ${txt('visited', 'تمت زيارتها')}</span><span>${stamps.length} ${txt('total', 'الإجمالي')}</span></div></div><section class="cards">${stamps.map((d, i) => { const date = state.visited[d.key]; return `<article class="card ${date ? (i % 2 ? 'olive-soft' : 'peach') : ''}"><div class="stamp-icon">${date ? '✓' : '🔒'}</div><a href="#destination?place=${d.key}" class="card-title passport-guide-link">${esc(ld(d, 'name'))} ${txt('Stamp', 'ختم')}</a><div class="card-copy">${date ? `${txt('Visited', 'تمت الزيارة')} · ${new Date(date).toLocaleDateString(state.lang === 'ar' ? 'ar-JO' : 'en-GB')}` : txt('Locked — visit or scan this landmark.', 'مغلق — قم بزيارة أو مسح هذا المعلم.')}</div><div class="passport-card-actions"><a class="btn small secondary" href="#destination?place=${d.key}">${txt('Open Guide', 'فتح الدليل')}</a><button class="btn small ${date ? 'danger-visit' : 'olive'}" data-action="toggle-visited" data-landmark="${d.key}">${date ? txt('Remove Visit', 'إلغاء الزيارة') : txt('Mark as Visited', 'تسجيل كزيارة')}</button></div></article>`; }).join('')}</section>`); }
+
+  function login() { if (state.user) return profile(); const register = hashParams().get('mode') === 'register'; const returnTo = safeReturnRoute(hashParams().get('return') || sessionStorage.getItem('tc_return_after_login')); if (returnTo) sessionStorage.setItem('tc_return_after_login', returnTo); const encodedReturn = returnTo ? encodeURIComponent(returnTo) : ''; const switchHref = register ? `#login${encodedReturn ? `?return=${encodedReturn}` : ''}` : `#login?mode=register${encodedReturn ? `&return=${encodedReturn}` : ''}`; return page(register ? txt('Create Account', 'إنشاء حساب') : txt('Sign In', 'تسجيل الدخول'), txt('Secure access to your account.', 'دخول آمن إلى حسابك.'), `<div class="auth-note firebase-auth-note"><strong>${txt('Secure Account', 'حساب آمن')}</strong><br>${txt('Your account is securely created and verified online so your data stays available across sessions.', 'يتم إنشاء حسابك والتحقق منه بأمان عبر الإنترنت حتى تبقى بياناتك متاحة بين جلسات الاستخدام.')}</div><form id="${register ? 'register-form' : 'login-form'}" class="form auth-form">${register ? `<div class="field"><label>${txt('Full Name', 'الاسم الكامل')}</label><input class="input" name="name" required minlength="2"/></div>` : ''}<div class="field"><label>${txt('Email Address', 'البريد الإلكتروني')}</label><input type="email" class="input" name="email" autocomplete="email" required/></div><div class="field"><label>${txt('Password', 'كلمة المرور')}</label><input type="password" class="input" name="password" autocomplete="${register ? 'new-password' : 'current-password'}" required minlength="6"/></div><div class="btn-row"><button class="btn" type="submit">${register ? txt('Create Account', 'إنشاء الحساب') : txt('Sign In', 'تسجيل الدخول')}</button><a class="btn secondary" href="${switchHref}">${register ? txt('I already have an account', 'لدي حساب بالفعل') : txt('Create Account', 'إنشاء حساب')}</a></div></form>`); }
+
+  function profile() { if (!state.user) return login(); const ownTrips = state.trips.filter(t => !t.owner || t.owner === state.user.email); const ownStories = communityStories().filter(story => ownsStory(story)); const stamps = Object.values(LANDMARKS).filter(d => state.visited[d.key]).length; return page(`${txt('Welcome', 'مرحباً')}, ${esc(state.user.name || state.user.email.split('@')[0])}`, txt('Manage your trips, stories, passport, and settings.', 'أدر رحلاتك وقصصك وجواز السفر والإعدادات.'), `<section class="profile-stats"><div class="profile-stat">${txt('Trips', 'الرحلات')}<strong>${ownTrips.length}</strong></div><div class="profile-stat">${txt('Stamps', 'الأختام')}<strong>${stamps}</strong></div><div class="profile-stat">${txt('Stories', 'القصص')}<strong>${ownStories.length}</strong></div><div class="profile-stat">${txt('Language', 'اللغة')}<strong>${state.lang.toUpperCase()}</strong></div></section><section class="cards">${card(txt('My Trips', 'رحلاتي'), txt('Saved and active plans.', 'الخطط المحفوظة والنشطة.'), 'my-trips', 'peach')}${card(txt('Jordan Passport', 'جواز الأردن'), txt('Your unlocked landmark stamps.', 'أختام المعالم التي فتحتها.'), 'passport', 'olive-soft')}${card(txt('My Stories', 'قصصي'), txt('Published traveler stories.', 'قصص المسافر التي نشرتها.'), 'stories?mine=1')}${card(txt('Settings', 'الإعدادات'), txt('Language and app preferences.', 'اللغة وتفضيلات التطبيق.'), 'settings')}</section><div class="callout"><h3>${txt('Secure Cloud Sync', 'مزامنة سحابية آمنة')}</h3><p>${txt('Your trips, passport stamps, stories, profile, and active trip progress are securely synced with your account.', 'تتم مزامنة رحلاتك وأختام جواز السفر والقصص والملف الشخصي وتقدم الرحلة بأمان مع حسابك.')}</p></div><button class="btn secondary" data-action="logout">${txt('Sign Out', 'تسجيل الخروج')}</button>`); }
+
+  function myTrips() {
+    if (!state.user) return page(txt('My Trips', 'رحلاتي'), txt('Sign in to save and manage trips.', 'سجل الدخول لحفظ الرحلات وإدارتها.'), `<a class="btn" href="#login?return=my-trips">${txt('Sign In', 'تسجيل الدخول')}</a>`);
+    const trips = state.trips.filter(t => !t.owner || t.owner === state.user.email).slice().reverse();
+    return page(txt('My Trips', 'رحلاتي'), txt('Open, resume, restart, or delete your saved plans.', 'افتح خططك المحفوظة أو تابعها أو أعد تشغيلها أو احذفها.'), `${trips.length ? `<section class="trip-list">${trips.map(t => { const active = state.activeTrip?.id === t.id; const completed = !!t.completedAt; const progress = active ? state.activeStopIndex : Math.min(Number(t.progressIndex || 0), t.stops?.length || 0); const label = active ? txt('Resume', 'متابعة') : completed ? txt('Start Again', 'ابدأ من جديد') : progress > 0 ? txt('Resume', 'متابعة') : txt('Start', 'بدء'); return `<article class="trip-card"><div><span class="eyebrow">${t.type === 'manual' ? txt('Manual plan', 'خطة يدوية') : txt('Smart plan', 'خطة ذكية')}</span><h3>${esc(t.name)}</h3><p>${esc((t.stops || []).map(s => state.lang === 'ar' ? (s.ar || s.name) : s.name).join(' → '))}</p><div class="trip-card-status">${completed ? `✓ ${txt('Completed', 'مكتملة')}` : active ? `● ${txt('Active', 'نشطة')} · ${progress}/${t.stops.length}` : progress > 0 ? `${txt('Saved progress', 'تقدم محفوظ')}: ${progress}/${t.stops.length}` : `${t.stops.length} ${txt('stops', 'محطات')}`}</div></div><div class="trip-actions"><button class="btn small" data-action="open-trip" data-trip="${t.id}">${txt('Open', 'فتح')}</button><button class="btn small olive" data-action="start-saved-trip" data-trip="${t.id}">${label}</button><button class="icon-btn danger" data-action="delete-trip" data-trip="${t.id}">×</button></div></article>`; }).join('')}</section>` : `<div class="empty-note">${txt('No saved trips yet. Create a smart or manual plan first.', 'لا توجد رحلات محفوظة بعد. أنشئ خطة ذكية أو يدوية أولاً.')}</div>`}<div class="btn-row" style="margin-top:18px"><a class="btn" href="#plan">${txt('Plan a New Trip', 'خطط رحلة جديدة')}</a>${state.activeTrip ? `<a class="btn olive" href="#live-trip">${txt('Resume Active Trip', 'متابعة الرحلة النشطة')}</a>` : ''}</div>`);
+  }
+
+
+  function settings() { return page(txt('Settings', 'الإعدادات'), txt('Account and interface settings.', 'إعدادات الحساب والواجهة.'), `<section class="settings-grid"><div class="callout"><h3>${txt('Language', 'اللغة')}</h3><p>${txt('Switch the whole interface between English and Arabic.', 'بدّل الواجهة بين الإنجليزية والعربية.')}</p><button class="btn small" data-action="lang">${state.lang === 'en' ? 'العربية' : 'English'}</button></div><div class="callout peach"><h3>${txt('Reset My App Data', 'إعادة ضبط بياناتي')}</h3><p>${txt('Clears your trips, stories, passport stamps, and trip progress from this account and this browser. Your Secure Account account remains active.', 'يحذف رحلاتك وقصصك وأختام جواز السفر وتقدم الرحلات من هذا الحساب ومن هذا المتصفح، مع بقاء حساب Secure Account.')}</p><button class="btn small secondary" data-action="reset-demo">${txt('Reset My Data', 'إعادة ضبط بياناتي')}</button></div></section>`); }
+
+  function isMobileScanDevice() { const ua = navigator.userAgent || ''; const mobileHint = navigator.userAgentData?.mobile; return mobileHint === true || /Android.*Mobile|iPhone|iPod|Windows Phone|IEMobile|Opera Mini/i.test(ua); }
+  function stopCamera() { if (cameraStream) { cameraStream.getTracks().forEach(t => t.stop()); cameraStream = null; } }
+  async function startCamera() { if (currentRoute() !== 'scan' || !isMobileScanDevice()) return; const video = document.getElementById('scan-video'), status = document.getElementById('camera-status'), enable = document.getElementById('enable-camera'); if (!video) return; if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) { if (status) status.textContent = txt('Camera needs HTTPS (or localhost).', 'الكاميرا تحتاج HTTPS أو localhost.'); if (enable) enable.hidden = false; return; } try { stopCamera(); cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }); video.srcObject = cameraStream; await video.play(); if (status) status.textContent = txt('Camera ready', 'الكاميرا جاهزة'); if (enable) enable.hidden = true; } catch (e) { if (status) status.textContent = txt('Camera permission was not granted.', 'لم يتم منح إذن الكاميرا.'); if (enable) enable.hidden = false; } }
+  function resetCapturedScan() { capturedScanBlob = null; if (capturedScanUrl) URL.revokeObjectURL(capturedScanUrl); capturedScanUrl = ''; document.getElementById('camera-box')?.classList.remove('has-preview'); document.getElementById('scan-preview')?.removeAttribute('src'); const r = document.getElementById('retake-scan'); if (r) r.hidden = true; }
+  async function captureFrame() { const video = document.getElementById('scan-video'), canvas = document.getElementById('scan-canvas'), box = document.getElementById('camera-box'), preview = document.getElementById('scan-preview'); if (!video || !canvas || !video.videoWidth) throw new Error(txt('Camera is not ready yet.', 'الكاميرا ليست جاهزة بعد.')); const scale = Math.min(1, 1024 / video.videoWidth); canvas.width = Math.round(video.videoWidth * scale); canvas.height = Math.round(video.videoHeight * scale); canvas.getContext('2d', { alpha: false }).drawImage(video, 0, 0, canvas.width, canvas.height); const blob = await new Promise((resolve, reject) => canvas.toBlob(b => b ? resolve(b) : reject(new Error('capture failed')), 'image/jpeg', .88)); capturedScanBlob = blob; if (capturedScanUrl) URL.revokeObjectURL(capturedScanUrl); capturedScanUrl = URL.createObjectURL(blob); if (preview) preview.src = capturedScanUrl; if (box) box.classList.add('has-preview'); document.getElementById('retake-scan')?.removeAttribute('hidden'); return blob; }
+  function blobToDataUrl(blob) { return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = reject; r.readAsDataURL(blob); }); }
+  async function analyzeCapturedLandmark(blob) { if (scanAnalyzing) return; scanAnalyzing = true; const progress = document.getElementById('scan-progress'), progressText = document.getElementById('scan-progress-text'), captureBtn = document.getElementById('capture-analyze'); if (progress) progress.hidden = false; if (captureBtn) captureBtn.disabled = true; try { if (!window.TourismLandmarkAI?.recognize) throw new Error(txt('Recognition engine is still loading. Check internet and retry.', 'محرك التعرف ما زال قيد التحميل. تحقق من الإنترنت وحاول مجدداً.')); const result = await window.TourismLandmarkAI.recognize(blob, m => { if (progressText) progressText.textContent = m; }); if (!result.accepted) throw new Error(txt('The photo is not clear enough. Retake it with a wider view of the landmark.', 'الصورة غير واضحة بما يكفي. أعد التصوير مع إظهار المعلم بشكل أوسع.')); const image = await blobToDataUrl(blob); sessionStorage.setItem('tc_scan_result', JSON.stringify({ key: result.key, confidence: result.score, image, matches: result.matches || [] })); sessionStorage.setItem('tc_destination', result.key); state.visited[result.key] = state.visited[result.key] || new Date().toISOString(); save(); stopCamera(); go(`scan-result?place=${result.key}`); } catch (err) { toast(err?.message || txt('Could not recognize this landmark.', 'تعذر التعرف على المعلم.')); if (progressText) progressText.textContent = txt('Recognition failed. Retake and try again.', 'فشل التعرف. أعد التصوير وحاول مجدداً.'); if (captureBtn) captureBtn.disabled = false; scanAnalyzing = false; } }
+  async function captureAndAnalyze() { try { if (!isMobileScanDevice()) return toast(txt('Camera scanning is available on phones only.', 'المسح بالكاميرا متاح على الهواتف فقط.')); if (!cameraStream) await startCamera(); const blob = await captureFrame(); stopCamera(); await analyzeCapturedLandmark(blob); } catch (err) { toast(err?.message || txt('Camera is not ready.', 'الكاميرا ليست جاهزة.')); } }
+
+  function loadImageFile(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const image = new Image();
+      image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
+      image.onerror = () => { URL.revokeObjectURL(url); reject(new Error(txt('Could not read this image.', 'تعذر قراءة هذه الصورة.'))); };
+      image.src = url;
+    });
+  }
+
+  async function prepareStoryImage(file) {
+    if (!file) return '';
+    if (!file.type.startsWith('image/')) throw new Error(txt('Choose an image file.', 'اختر ملف صورة.'));
+    if (file.size > 12_000_000) throw new Error(txt('Choose an image under 12 MB.', 'اختر صورة أقل من 12 ميجابايت.'));
+
+    const image = await loadImageFile(file);
+    const maxSide = 1200;
+    const scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+    let quality = .82;
+    let dataUrl = canvas.toDataURL('image/jpeg', quality);
+    while (dataUrl.length > 300_000 && quality > .46) {
+      quality -= .08;
+      dataUrl = canvas.toDataURL('image/jpeg', quality);
+    }
+    if (dataUrl.length > 450_000) throw new Error(txt('This image is still too large. Try another photo.', 'حجم الصورة ما زال كبيراً. جرّب صورة أخرى.'));
+    return dataUrl;
+  }
+
+  const views = { home, explore, results, destination, plan, 'ai-planner': aiPlanner, itinerary, 'manual-planner': manualPlanner, 'live-trip': liveTrip, scan, 'scan-result': scanResult, stories, story: storyDetail, 'share-story': shareStory, passport, login, profile, 'my-trips': myTrips, settings };
+  function render() { const route = currentRoute(); if (route !== 'scan') stopCamera(); document.body.classList.toggle('scan-mobile-device', route === 'scan' && isMobileScanDevice()); document.getElementById('app').innerHTML = shell((views[route] || home)()); bind(); window.scrollTo({ top: 0, behavior: 'instant' }); }
+
+  function bind() {
+    document.querySelectorAll('[data-action="back"]').forEach(b => b.onclick = () => { if (history.length > 1) { history.back(); } else { go('home'); } });
+    document.querySelectorAll('[data-action="lang"]').forEach(b => b.onclick = () => { state.lang = state.lang === 'en' ? 'ar' : 'en'; save(); render(); });
+    const search = document.getElementById('destination-search'); if (search) search.oninput = applyResultFilter;
+    document.querySelectorAll('[data-result-filter]').forEach(b => b.onclick = () => { document.querySelectorAll('[data-result-filter]').forEach(x => x.classList.remove('active')); b.classList.add('active'); applyResultFilter(); });
+    const interestFromUrl = hashParams().get('interest'); if (currentRoute() === 'results' && interestFromUrl && interestFromUrl !== 'all') { document.querySelectorAll('.result-card').forEach(c => c.style.display = c.dataset.tags.includes(interestFromUrl) ? 'flex' : 'none'); }
+    document.querySelectorAll('#interest-chips .chip').forEach(b => b.onclick = () => b.classList.toggle('active'));
+
+    const ai = document.getElementById('ai-form'); if (ai) ai.onsubmit = e => { e.preventDefault(); const form = Object.fromEntries(new FormData(ai)); const interests = [...document.querySelectorAll('#interest-chips .chip.active')].map(x => x.dataset.interest); state.currentPlan = buildSmartPlan(form, interests.length ? interests : ['history']); save(); go('itinerary'); };
+
+    document.querySelectorAll('[data-action="manual-add"]').forEach(b => b.onclick = () => { const v = document.getElementById('manual-search')?.value; if (!v) return toast(txt('No more destinations available.', 'لا توجد وجهات إضافية متاحة.')); if (!state.manualDraft.includes(v)) state.manualDraft.push(v); save(); render(); });
+    document.querySelectorAll('[data-remove-manual]').forEach(b => b.onclick = () => { state.manualDraft.splice(Number(b.dataset.removeManual), 1); save(); render(); });
+    document.querySelectorAll('[data-manual-move]').forEach(b => b.onclick = () => { const i = Number(b.dataset.index), j = b.dataset.manualMove === 'up' ? i - 1 : i + 1; if (j < 0 || j >= state.manualDraft.length) return;[state.manualDraft[i], state.manualDraft[j]] = [state.manualDraft[j], state.manualDraft[i]]; save(); render(); });
+    document.querySelectorAll('[data-action="save-manual"]').forEach(b => b.onclick = () => { if (!state.manualDraft.length) return toast(txt('Add at least one destination.', 'أضف وجهة واحدة على الأقل.')); if (!requireUser('manual-planner')) return; const p = manualPlanObject(); p.owner = state.user.email; state.trips.push(p); state.currentPlan = p; save(); toast(txt('Custom trip saved.', 'تم حفظ الرحلة المخصصة.')); });
+    document.querySelectorAll('[data-action="manual-start"]').forEach(b => b.onclick = () => { if (!state.manualDraft.length) return toast(txt('Add at least one destination.', 'أضف وجهة واحدة على الأقل.')); state.currentPlan = manualPlanObject(); state.activeTrip = { ...state.currentPlan, progressIndex: 0 }; state.activeStopIndex = 0; state.activeStartedAt = new Date().toISOString(); save(); go('live-trip'); });
+    document.querySelectorAll('[data-action="save-itinerary"]').forEach(b => b.onclick = () => { if (!requireUser('itinerary')) return; const p = state.currentPlan; if (!p) return; if (state.trips.some(t => t.id === p.id && (!t.owner || t.owner === state.user.email))) return toast(txt('This trip is already saved.', 'هذه الرحلة محفوظة بالفعل.')); const copy = { ...p, id: id(), owner: state.user.email, created: new Date().toISOString() }; state.trips.push(copy); state.currentPlan = copy; save(); render(); toast(txt('Trip saved to My Trips.', 'تم حفظ الرحلة في رحلاتي.')); });
+    document.querySelectorAll('[data-action="start-plan"]').forEach(b => b.onclick = () => { if (!state.currentPlan) return; state.activeTrip = { ...state.currentPlan, progressIndex: 0 }; state.activeStopIndex = 0; state.activeStartedAt = new Date().toISOString(); save(); go('live-trip'); });
+    document.querySelectorAll('[data-action="start-current-trip"]').forEach(b => b.onclick = () => { if (!state.currentPlan?.stops?.length) return; state.activeTrip = { ...state.currentPlan }; state.activeStopIndex = Math.min(Number(state.currentPlan.progressIndex || 0), Math.max(0, state.currentPlan.stops.length - 1)); state.activeStartedAt = new Date().toISOString(); save(); render(); });
+    document.querySelectorAll('[data-action="restart-trip"]').forEach(b => b.onclick = () => { const p = state.activeTrip || state.currentPlan; if (!p?.stops?.length) return; if (!confirm(txt('Restart this trip from the first stop?', 'إعادة هذه الرحلة من المحطة الأولى؟'))) return; state.activeTrip = { ...p, completedAt: null, progressIndex: 0 }; state.activeStopIndex = 0; state.activeStartedAt = new Date().toISOString(); const saved = state.trips.find(t => t.id === p.id); if (saved) { saved.progressIndex = 0; delete saved.completedAt; } save(); render(); toast(txt('Trip restarted from the first stop.', 'تمت إعادة الرحلة من المحطة الأولى.')); });
+    document.querySelectorAll('[data-action="complete-stop"]').forEach(b => b.onclick = () => { const p = state.activeTrip; if (!p?.stops?.length) return; const index = Math.min(state.activeStopIndex || 0, p.stops.length - 1), s = p.stops[index]; if (s?.landmark) state.visited[s.landmark] = state.visited[s.landmark] || new Date().toISOString(); const saved = state.trips.find(t => t.id === p.id); if (index >= p.stops.length - 1) { if (saved) { saved.progressIndex = p.stops.length; saved.completedAt = new Date().toISOString(); } state.currentPlan = { ...p, progressIndex: p.stops.length, completedAt: new Date().toISOString() }; state.activeTrip = null; state.activeStopIndex = 0; state.activeStartedAt = null; save(); toast(txt('Trip completed!', 'تم إنهاء الرحلة!')); go('passport'); } else { state.activeStopIndex = index + 1; state.activeTrip.progressIndex = state.activeStopIndex; if (saved) saved.progressIndex = state.activeStopIndex; save(); render(); toast(txt('Next stop loaded.', 'تم الانتقال إلى المحطة التالية.')); } });
+
+    document.querySelectorAll('[data-action="add-landmark"]').forEach(b => b.onclick = () => { const d = landmarkByKey(b.dataset.landmark); if (!state.manualDraft.includes(d.key)) state.manualDraft.push(d.key); save(); toast(txt(`${d.name} added to the manual planner.`, `${ld(d, 'name')} تمت إضافته إلى التخطيط اليدوي.`)); });
+    document.querySelectorAll('[data-action="toggle-visited"],[data-action="mark-visited"]').forEach(b => b.onclick = () => { const key = b.dataset.landmark; if (state.visited[key]) { delete state.visited[key]; save(); render(); toast(txt('Visit removed and the passport stamp was locked again.', 'تم إلغاء الزيارة وإغلاق ختم جواز السفر من جديد.')); } else { state.visited[key] = new Date().toISOString(); save(); render(); toast(txt('Visit saved and the passport stamp was unlocked.', 'تم حفظ الزيارة وفتح ختم جواز السفر.')); } });
+
+    document.querySelectorAll('[data-action="capture-analyze"]').forEach(b => b.onclick = captureAndAnalyze); document.querySelectorAll('[data-action="enable-camera"]').forEach(b => b.onclick = startCamera); document.querySelectorAll('[data-action="retake"]').forEach(b => b.onclick = async () => { scanAnalyzing = false; resetCapturedScan(); const p = document.getElementById('scan-progress'); if (p) p.hidden = true; const c = document.getElementById('capture-analyze'); if (c) c.disabled = false; await startCamera(); });
+    document.querySelectorAll('[data-action="audio"]').forEach(b => b.onclick = () => { const d = landmarkByKey(b.dataset.landmark || destinationKey()); if (!('speechSynthesis' in window)) return toast(txt('Audio narration is not supported in this browser.', 'المتصفح لا يدعم القراءة الصوتية.')); speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(`${ld(d, 'destinationTitle')}. ${ld(d, 'about')} ${ld(d, 'story')}`); u.lang = state.lang === 'ar' ? 'ar-JO' : 'en-US'; u.rate = .92; speechSynthesis.speak(u); }); document.querySelectorAll('[data-action="read"]').forEach(b => b.onclick = () => document.getElementById('scan-reading')?.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+
+    const img = document.getElementById('story-image'); if (img) img.onchange = async () => { try { storyDraftImage = await prepareStoryImage(img.files?.[0]); const p = document.getElementById('story-preview'); if (p && storyDraftImage) p.innerHTML = `<img src="${storyDraftImage}" alt="preview"/>`; } catch (e) { toast(e.message); img.value = ''; storyDraftImage = ''; } };
+    document.querySelectorAll('[data-rating]').forEach(b => b.onclick = () => { state.rating = Number(b.dataset.rating); document.querySelectorAll('[data-rating]').forEach(x => x.classList.toggle('active', x === b)); });
+    const storyForm = document.getElementById('story-form');
+    if (storyForm) storyForm.onsubmit = async event => {
+      event.preventDefault();
+      if (!state.user) { requireUser('share-story'); return; }
+      const submit = storyForm.querySelector('button[type="submit"]');
+      if (submit) submit.disabled = true;
+      try {
+        const form = new FormData(storyForm);
+        const story = {
+          id: id(),
+          title: String(form.get('title') || '').trim(),
+          experience: String(form.get('experience') || '').trim(),
+          location: String(form.get('location') || '').trim(),
+          rating: state.rating,
+          image: storyDraftImage,
+          date: new Date().toISOString()
+        };
+        await publishStoryToCommunity(story);
+        storyDraftImage = '';
+        toast(txt('Story published for the community.', 'تم نشر القصة للمجتمع.'));
+        go('stories');
+      } catch (err) {
+        console.error('Story publish failed:', err);
+        toast(txt('Could not publish the story. Check your connection and try again.', 'تعذر نشر القصة. تحقق من الاتصال وحاول مرة أخرى.'));
+        if (submit) submit.disabled = false;
+      }
+    };
+
+    document.querySelectorAll('[data-action="delete-story"]').forEach(button => button.onclick = async () => {
+      if (!confirm(txt('Delete this story?', 'حذف هذه القصة؟'))) return;
+      button.disabled = true;
+      try {
+        await deleteStoryFromCommunity(button.dataset.story);
+        toast(txt('Story deleted.', 'تم حذف القصة.'));
+        go(button.dataset.storyBack === 'mine' ? 'stories?mine=1' : 'stories');
+      } catch (err) {
+        console.error('Story delete failed:', err);
+        toast(txt('Could not delete this story.', 'تعذر حذف القصة.'));
+        button.disabled = false;
+      }
+    });
+
+    const reg = document.getElementById('register-form'); if (reg) reg.onsubmit = async e => { e.preventDefault(); const submit = reg.querySelector('button[type="submit"]'); if (submit) submit.disabled = true; try { const f = new FormData(reg), name = String(f.get('name')).trim(), email = String(f.get('email')).trim().toLowerCase(), password = String(f.get('password')); const api = await firebaseReady; const credential = await api.createUserWithEmailAndPassword(api.auth, email, password); await api.updateProfile(credential.user, { displayName: name }); state.user = { id: credential.user.uid, name, email: credential.user.email || email }; save(); toast(txt('Account created successfully.', 'تم إنشاء الحساب بنجاح.')); const ret = safeReturnRoute(hashParams().get('return') || sessionStorage.getItem('tc_return_after_login')); sessionStorage.removeItem('tc_return_after_login'); go(ret || 'profile'); } catch (err) { console.error(err); toast(firebaseMessage(err)); if (submit) submit.disabled = false; } };
+    const lf = document.getElementById('login-form'); if (lf) lf.onsubmit = async e => { e.preventDefault(); const submit = lf.querySelector('button[type="submit"]'); if (submit) submit.disabled = true; try { const f = new FormData(lf), email = String(f.get('email')).trim().toLowerCase(), password = String(f.get('password')); const api = await firebaseReady; const credential = await api.signInWithEmailAndPassword(api.auth, email, password); state.user = { id: credential.user.uid, name: credential.user.displayName || '', email: credential.user.email || email }; save(); toast(txt('Signed in successfully.', 'تم تسجيل الدخول بنجاح.')); const ret = safeReturnRoute(hashParams().get('return') || sessionStorage.getItem('tc_return_after_login')); sessionStorage.removeItem('tc_return_after_login'); go(ret || 'profile'); } catch (err) { console.error(err); toast(firebaseMessage(err)); if (submit) submit.disabled = false; } };
+    document.querySelectorAll('[data-action="logout"]').forEach(b => b.onclick = async () => { try { const api = await firebaseReady; await syncCloudState(); await api.signOut(api.auth); state.user = null; clearUserScopedState(); saveLocalOnly(); toast(txt('Signed out.', 'تم تسجيل الخروج.')); go('login'); } catch (err) { console.error(err); toast(firebaseMessage(err)); } });
+
+    document.querySelectorAll('[data-action="open-trip"]').forEach(b => b.onclick = () => { const p = state.trips.find(t => t.id === b.dataset.trip); if (!p) return; state.currentPlan = p; save(); go('itinerary'); });
+    document.querySelectorAll('[data-action="start-saved-trip"]').forEach(b => b.onclick = () => { const p = state.trips.find(t => t.id === b.dataset.trip); if (!p) return; state.currentPlan = p; if (state.activeTrip?.id === p.id) { save(); go('live-trip'); return; } const resumeIndex = p.completedAt ? 0 : Math.min(Number(p.progressIndex || 0), Math.max(0, p.stops.length - 1)); if (p.completedAt) { delete p.completedAt; p.progressIndex = 0; } state.activeTrip = { ...p, progressIndex: resumeIndex }; state.activeStopIndex = resumeIndex; state.activeStartedAt = new Date().toISOString(); save(); go('live-trip'); });
+    document.querySelectorAll('[data-action="delete-trip"]').forEach(b => b.onclick = () => { if (!confirm(txt('Delete this saved trip?', 'حذف هذه الرحلة المحفوظة؟'))) return; state.trips = state.trips.filter(t => t.id !== b.dataset.trip); if (state.currentPlan?.id === b.dataset.trip) state.currentPlan = null; if (state.activeTrip?.id === b.dataset.trip) { state.activeTrip = null; state.activeStopIndex = 0; state.activeStartedAt = null; } save(); render(); toast(txt('Trip deleted.', 'تم حذف الرحلة.')); });
+    document.querySelectorAll('[data-action="reset-demo"]').forEach(button => button.onclick = async () => {
+      if (!confirm(txt('Delete your saved trips, stories, passport stamps, and trip progress from your account and this browser?', 'حذف رحلاتك وقصصك وأختام جواز السفر وتقدم الرحلات من حسابك ومن هذا المتصفح؟'))) return;
+      button.disabled = true;
+      try {
+        await deleteMyPublicStories();
+        await syncNamedCollection('stories', []); // removes the older private-story copies from V27
+        const currentUser = state.user;
+        clearUserScopedState();
+        state.user = currentUser;
+        saveLocalOnly();
+        await syncCloudState();
+        toast(txt('Your app data was reset.', 'تمت إعادة ضبط بياناتك.'));
+        go('home');
+      } catch (err) {
+        console.error('Account data reset failed:', err);
+        toast(txt('Could not finish resetting your data. Try again.', 'تعذر إكمال إعادة ضبط بياناتك. حاول مرة أخرى.'));
+        button.disabled = false;
+      }
+    });
+    if (currentRoute() === 'scan' && isMobileScanDevice()) setTimeout(startCamera, 120);
+  }
+
+  function applyResultFilter() { const query = (document.getElementById('destination-search')?.value || '').trim().toLowerCase(); const active = document.querySelector('[data-result-filter].active')?.dataset.resultFilter || 'all'; document.querySelectorAll('.result-card').forEach(c => { const matchesText = !query || (c.dataset.name || '').includes(query); const matchesFilter = active === 'all' || (c.dataset.tags || '').includes(active); c.style.display = matchesText && matchesFilter ? 'flex' : 'none'; }); }
+
+  addEventListener('hashchange', render);
+  if (!location.hash) location.hash = 'home';
+  render();
+})();
