@@ -1,7 +1,3 @@
-# Tourism Compass — V25 (VS Code)
-
-هذه النسخة مبنية باستخدام **HTML + CSS + Vanilla JavaScript + Firebase + Vite** ومهيأة للعمل من Visual Studio Code.
-
 ## ما يعمل فعليًا
 - Firebase Authentication (Email/Password)
 - Cloud Firestore
